@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+*.log
+.venv/
+venv/
+env/
+
+# Runtime data. Do not commit real account/task data.
+steam_task_assistant/data/
+steam_task_assistant/screenshots/
+steam_task_assistant/browser_profile/
+steam_task_assistant/screenshots_full_auto_test/
+
+# User workbooks and deployment reports may contain accounts, passwords, codes, or screenshots.
+*.xlsx
+*.xls
+*.csv
+*.tsv
+*.ndjson
+*.sqlite
+*.sqlite3
+*.db
+outputs/
+
+# Local diagnostics.
+*.png
+*.jpg
+*.jpeg
+*.webp
