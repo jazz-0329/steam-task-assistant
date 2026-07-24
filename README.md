@@ -1,28 +1,31 @@
 # Steam Task Assistant
 
-A local Tkinter + Playwright assistant for operating Steam account task workflows.
+A local Windows Tkinter + Playwright assistant for operating authorized Steam account task workflows.
 
-The app supports four workflow modes:
+This public repository intentionally contains only the program source. It does not include any real account database, passwords, wallet codes, activation keys, screenshots, customer reports, browser profiles, or deployment spreadsheets.
 
-- wallet code redemption
-- product key activation
-- game purchase
-- last-played detection
+## Workflow Modes
 
-This public repository intentionally contains only the program source. It does not include any real account database, passwords, wallet codes, activation keys, screenshots, customer reports, or deployment spreadsheets.
+- Wallet code redemption
+- Product key activation
+- Game purchase
+- Last-played detection
+- Friend invite link pickup and automatic gift claim
 
 ## Safety Notice
 
-This tool can automate browser actions against Steam pages. Use it only with accounts and codes that you are authorized to operate. Keep all task databases and screenshots local. Do not commit runtime data to GitHub.
+This tool can automate browser actions against Steam pages. Use it only with accounts, codes, and purchases that you are authorized to operate.
+
+Keep all task databases, account workbooks, screenshots, and generated reports local. Do not commit runtime data to GitHub.
 
 The included `.gitignore` excludes:
 
 - SQLite task databases
-- browser profiles
-- screenshots
-- Excel/CSV workbooks
-- deployment reports
-- local diagnostics and logs
+- Browser profiles
+- Screenshots
+- Excel/CSV/TSV workbooks
+- Deployment reports
+- Local diagnostics and logs
 
 ## Requirements
 
@@ -49,9 +52,15 @@ On Windows, you can also double-click:
 run_app.bat
 ```
 
+Debug launch, with a console window kept open:
+
+```text
+run_app_debug.bat
+```
+
 ## Task Import Format
 
-Import tasks from an Excel workbook with these columns:
+Import tasks from an Excel workbook. The app recognizes these Chinese column names:
 
 ```text
 序号
@@ -69,6 +78,12 @@ Steam密码
 激活码列表
 模式
 备注
+提货码
+提货网址
+账号链接
+好友链接1
+好友链接2
+提货状态
 ```
 
 The `模式` value should match one of:
@@ -78,9 +93,12 @@ The `模式` value should match one of:
 激活码激活
 游戏购买
 游玩时间检测
+好友码提货
 ```
 
 Multiple wallet codes or activation keys can be separated by line breaks, commas, semicolons, or whitespace.
+
+Friend-code pickup tasks may include pickup code, pickup URL, profile link, and two friend invite link fields. The app writes collected invite links and claim status into the local SQLite task database only.
 
 ## Runtime Files
 
@@ -111,4 +129,4 @@ python -m py_compile steam_task_assistant\app.py steam_task_assistant\launch_gui
 git status --ignored -sb
 ```
 
-Confirm that no real `.xlsx`, `.sqlite3`, screenshots, account exports, wallet codes, or product keys are staged.
+Confirm that no real `.xlsx`, `.sqlite3`, screenshots, account exports, wallet codes, product keys, or browser profile files are staged.

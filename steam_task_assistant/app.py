@@ -30,8 +30,10 @@ STEAM_HISTORY_URL = "https://store.steampowered.com/account/history/"
 STEAM_LICENSES_URL = "https://store.steampowered.com/account/licenses/"
 STEAM_CART_URL = "https://store.steampowered.com/cart/"
 STEAM_SEARCH_URL = "https://store.steampowered.com/search/?term="
+STEAM_FRIENDS_ADD_URL = "https://steamcommunity.com/my/friends/add"
+STEAM_PENDING_GIFTS_URL = "https://steamcommunity.com/my/inventory/#pending_gifts"
 
-MODES = ("兑换码兑换", "激活码激活", "游戏购买", "游玩时间检测")
+MODES = ("兑换码兑换", "激活码激活", "游戏购买", "游玩时间检测", "好友码提货")
 STATUSES = ("未处理", "处理中", "需要人工处理", "成功", "部分成功", "失败", "跳过")
 REQUIRED_COLUMNS = {
     "序号",
@@ -176,6 +178,11 @@ class Task:
     last_played_time: str
     last_played_days: str
     last_played_source: str
+    pickup_code: str
+    pickup_url: str
+    friend_link_1: str
+    friend_link_2: str
+    pickup_status: str
 
 
 class TaskStore:
@@ -205,6 +212,11 @@ class TaskStore:
                 mode TEXT,
                 note TEXT,
                 screenshot_dir TEXT,
+                pickup_code TEXT,
+                pickup_url TEXT,
+                friend_link_1 TEXT,
+                friend_link_2 TEXT,
+                pickup_status TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
@@ -238,6 +250,11 @@ class TaskStore:
             "last_played_time",
             "last_played_days",
             "last_played_source",
+            "pickup_code",
+            "pickup_url",
+            "friend_link_1",
+            "friend_link_2",
+            "pickup_status",
         ):
             if column_name not in existing_columns:
                 self.conn.execute(f"ALTER TABLE tasks ADD COLUMN {column_name} TEXT")
@@ -249,6 +266,18 @@ class TaskStore:
         self.conn.execute("DELETE FROM tasks")
         self.conn.commit()
 
+    def _clear_mode_tasks(self, mode: str) -> None:
+        ids = [
+            row["id"]
+            for row in self.conn.execute("SELECT id FROM tasks WHERE mode = ?", (mode,)).fetchall()
+        ]
+        if not ids:
+            return
+        placeholders = ",".join("?" for _ in ids)
+        self.conn.execute(f"DELETE FROM voucher_results WHERE task_id IN ({placeholders})", ids)
+        self.conn.execute(f"DELETE FROM events WHERE task_id IN ({placeholders})", ids)
+        self.conn.execute(f"DELETE FROM tasks WHERE id IN ({placeholders})", ids)
+
     def import_excel(self, path: Path, replace: bool = True) -> int:
         wb = openpyxl.load_workbook(path, data_only=True)
         ws = wb["任务数据库"] if "任务数据库" in wb.sheetnames else wb.active
@@ -257,6 +286,13 @@ class TaskStore:
         if missing:
             raise ValueError("缺少标准列：" + "、".join(sorted(missing)))
         index = {name: headers.index(name) for name in headers if name}
+
+        def optional_value(row: tuple[object, ...], column_name: str) -> object:
+            column_index = index.get(column_name)
+            if column_index is None or column_index >= len(row):
+                return ""
+            return row[column_index]
+
         if replace:
             self.clear_tasks()
         count = 0
@@ -286,17 +322,24 @@ class TaskStore:
                 "mode": mode,
                 "note": row[index["备注"]],
                 "screenshot_dir": "",
+                "pickup_code": optional_value(row, "提货码"),
+                "pickup_url": optional_value(row, "提货网址"),
+                "friend_link_1": optional_value(row, "好友链接1"),
+                "friend_link_2": optional_value(row, "好友链接2"),
+                "pickup_status": optional_value(row, "提货状态"),
             }
             self.conn.execute(
                 """
                 INSERT INTO tasks (
                     row_no, status, region, province, city, store_code, store_name,
                     steam_account, steam_password, game_name, game_price, voucher_codes,
-                    activation_codes, mode, note, screenshot_dir
+                    activation_codes, mode, note, screenshot_dir, pickup_code, pickup_url,
+                    friend_link_1, friend_link_2, pickup_status
                 ) VALUES (
                     :row_no, :status, :region, :province, :city, :store_code, :store_name,
                     :steam_account, :steam_password, :game_name, :game_price, :voucher_codes,
-                    :activation_codes, :mode, :note, :screenshot_dir
+                    :activation_codes, :mode, :note, :screenshot_dir, :pickup_code, :pickup_url,
+                    :friend_link_1, :friend_link_2, :pickup_status
                 )
                 """,
                 values,
@@ -396,6 +439,106 @@ class TaskStore:
             count += 1
         self.conn.commit()
         return count
+
+    def import_friend_claim_tasks(self, workspace_root: Path, replace: bool = True) -> int:
+        v38_candidates = sorted(workspace_root.glob("*V3.8*.xlsx"))
+        if not v38_candidates:
+            raise FileNotFoundError("未找到 V3.8 账号清单，无法匹配58家账号的登录信息。")
+        report_candidates = list(
+            workspace_root.glob(
+                "outputs/**/ALIENWARE零售渠道Steam账号清单 《红色沙漠》部署.xlsx"
+            )
+        )
+        if not report_candidates:
+            raise FileNotFoundError("未找到《红色沙漠》部署报告，无法确认58家账号范围。")
+
+        report_path = max(report_candidates, key=lambda path: path.stat().st_mtime)
+        target_accounts = self._read_red_desert_deployment_accounts(report_path)
+        if len(target_accounts) != 58 or len({account.lower() for account in target_accounts}) != 58:
+            raise ValueError(
+                f"《红色沙漠》部署报告应包含58个唯一账号，当前读取到{len(target_accounts)}个。"
+            )
+
+        v38_rows = self._read_v38_account_rows(v38_candidates[0])
+        by_account = {
+            str(row.get("steam_account") or "").strip().lower(): row
+            for row in v38_rows
+            if row.get("steam_account") and row.get("steam_password")
+        }
+        missing_accounts = [
+            account for account in target_accounts if account.lower() not in by_account
+        ]
+        if missing_accounts:
+            raise ValueError(
+                f"有{len(missing_accounts)}个部署账号未能在V3.8清单中匹配账号和密码。"
+            )
+
+        if replace:
+            self._clear_mode_tasks("好友码提货")
+
+        for index, account in enumerate(target_accounts, start=1):
+            row = by_account[account.lower()]
+            values = {
+                "row_no": index,
+                "status": "未处理",
+                "region": row.get("region") or "",
+                "province": row.get("province") or "",
+                "city": row.get("city") or "",
+                "store_code": row.get("store_code") or "",
+                "store_name": row.get("store_name") or "",
+                "steam_account": row.get("steam_account") or "",
+                "steam_password": row.get("steam_password") or "",
+                "game_name": "红色沙漠",
+                "game_price": "",
+                "voucher_codes": "",
+                "activation_codes": "",
+                "mode": "好友码提货",
+                "note": "红色沙漠部署58家门店：批量采集两条Steam快速邀请链接",
+                "screenshot_dir": "",
+                "profile_link": row.get("profile_link") or "",
+                "pickup_code": "",
+                "pickup_url": "",
+                "friend_link_1": "",
+                "friend_link_2": "",
+                "pickup_status": "待采集",
+            }
+            self.conn.execute(
+                """
+                INSERT INTO tasks (
+                    row_no, status, region, province, city, store_code, store_name,
+                    steam_account, steam_password, game_name, game_price, voucher_codes,
+                    activation_codes, mode, note, screenshot_dir, profile_link, pickup_code,
+                    pickup_url, friend_link_1, friend_link_2, pickup_status
+                ) VALUES (
+                    :row_no, :status, :region, :province, :city, :store_code, :store_name,
+                    :steam_account, :steam_password, :game_name, :game_price, :voucher_codes,
+                    :activation_codes, :mode, :note, :screenshot_dir, :profile_link, :pickup_code,
+                    :pickup_url, :friend_link_1, :friend_link_2, :pickup_status
+                )
+                """,
+                values,
+            )
+        self.conn.commit()
+        return len(target_accounts)
+
+    def _read_red_desert_deployment_accounts(self, path: Path) -> list[str]:
+        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+        if "《红色沙漠》序列号" not in wb.sheetnames:
+            raise ValueError("《红色沙漠》部署报告中缺少《红色沙漠》序列号工作表。")
+        ws = wb["《红色沙漠》序列号"]
+        account_column = None
+        for cell in ws[1]:
+            if str(cell.value or "").strip() == "账号":
+                account_column = cell.column
+                break
+        if account_column is None:
+            raise ValueError("《红色沙漠》序列号工作表中缺少“账号”列。")
+        accounts = []
+        for row_index in range(2, ws.max_row + 1):
+            account = str(ws.cell(row_index, account_column).value or "").strip()
+            if account:
+                accounts.append(account)
+        return accounts
 
     def _read_sonic_racing_rows(self, path: Path) -> list[dict[str, str]]:
         wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
@@ -607,6 +750,54 @@ class TaskStore:
             tasks = tasks[:limit]
         return tasks
 
+    def pending_friend_claim_tasks(
+        self,
+        start_task_id: int | None = None,
+        limit: int = 0,
+    ) -> list[Task]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM tasks
+            WHERE mode = '好友码提货'
+              AND status IN ('未处理','处理中','需要人工处理')
+              AND (
+                    COALESCE(friend_link_1, '') = ''
+                    OR COALESCE(friend_link_2, '') = ''
+                  )
+            ORDER BY row_no, id
+            """
+        ).fetchall()
+        tasks = [self._row_to_task(row) for row in rows]
+        if start_task_id is not None:
+            start_index = next((i for i, task in enumerate(tasks) if task.id == start_task_id), 0)
+            tasks = tasks[start_index:]
+        if limit > 0:
+            tasks = tasks[:limit]
+        return tasks
+
+    def pending_friend_game_claim_tasks(
+        self,
+        start_task_id: int | None = None,
+        limit: int = 0,
+    ) -> list[Task]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM tasks
+            WHERE mode = '好友码提货'
+              AND COALESCE(game_name, '') <> ''
+              AND status IN ('未处理','处理中','需要人工处理','成功','部分成功')
+              AND COALESCE(pickup_status, '') NOT LIKE '自动游戏领取完成%'
+            ORDER BY row_no, id
+            """
+        ).fetchall()
+        tasks = [self._row_to_task(row) for row in rows]
+        if start_task_id is not None:
+            start_index = next((i for i, task in enumerate(tasks) if task.id == start_task_id), 0)
+            tasks = tasks[start_index:]
+        if limit > 0:
+            tasks = tasks[:limit]
+        return tasks
+
     def update_playtime_result(
         self,
         task_id: int,
@@ -639,6 +830,84 @@ class TaskStore:
                 source,
                 note,
                 note,
+                str(Path(screenshot_path).parent) if screenshot_path else "",
+                str(Path(screenshot_path).parent) if screenshot_path else "",
+                task_id,
+            ),
+        )
+        self.conn.commit()
+
+    def update_friend_claim_links(
+        self,
+        task_id: int,
+        friend_link_1: str,
+        friend_link_2: str,
+    ) -> None:
+        self.conn.execute(
+            """
+            UPDATE tasks
+            SET friend_link_1 = ?,
+                friend_link_2 = ?,
+                pickup_status = '好友链接已采集',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (friend_link_1, friend_link_2, task_id),
+        )
+        self.conn.commit()
+
+    def update_friend_claim_link(
+        self,
+        task_id: int,
+        link_number: int,
+        friend_link: str,
+    ) -> None:
+        """Persist each invite URL immediately so a later step cannot lose it."""
+        if link_number == 1:
+            self.conn.execute(
+                """
+                UPDATE tasks
+                SET friend_link_1 = ?,
+                    pickup_status = '已采集好友链接1，待生成好友链接2',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (friend_link, task_id),
+            )
+        elif link_number == 2:
+            self.conn.execute(
+                """
+                UPDATE tasks
+                SET friend_link_2 = ?,
+                    pickup_status = '已采集两条好友链接',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (friend_link, task_id),
+            )
+        else:
+            raise ValueError(f"不支持的好友链接编号：{link_number}")
+        self.conn.commit()
+
+    def update_friend_claim_state(
+        self,
+        task_id: int,
+        status: str,
+        pickup_status: str,
+        screenshot_path: str = "",
+    ) -> None:
+        self.conn.execute(
+            """
+            UPDATE tasks
+            SET status = ?,
+                pickup_status = ?,
+                screenshot_dir = CASE WHEN ? <> '' THEN ? ELSE screenshot_dir END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                status,
+                pickup_status,
                 str(Path(screenshot_path).parent) if screenshot_path else "",
                 str(Path(screenshot_path).parent) if screenshot_path else "",
                 task_id,
@@ -688,6 +957,11 @@ class TaskStore:
                     "上次游玩时间",
                     "距离今天",
                     "检测来源",
+                    "提货码",
+                    "提货网址",
+                    "好友链接1",
+                    "好友链接2",
+                    "提货状态",
                 ]
             )
             for row in rows:
@@ -714,6 +988,11 @@ class TaskStore:
                         row["last_played_time"],
                         row["last_played_days"],
                         row["last_played_source"],
+                        row["pickup_code"],
+                        row["pickup_url"],
+                        row["friend_link_1"],
+                        row["friend_link_2"],
+                        row["pickup_status"],
                     ]
                 )
 
@@ -742,6 +1021,11 @@ class TaskStore:
             last_played_time=row["last_played_time"] or "" if "last_played_time" in keys else "",
             last_played_days=row["last_played_days"] or "" if "last_played_days" in keys else "",
             last_played_source=row["last_played_source"] or "" if "last_played_source" in keys else "",
+            pickup_code=row["pickup_code"] or "" if "pickup_code" in keys else "",
+            pickup_url=row["pickup_url"] or "" if "pickup_url" in keys else "",
+            friend_link_1=row["friend_link_1"] or "" if "friend_link_1" in keys else "",
+            friend_link_2=row["friend_link_2"] or "" if "friend_link_2" in keys else "",
+            pickup_status=row["pickup_status"] or "" if "pickup_status" in keys else "",
         )
 
 
@@ -850,6 +1134,38 @@ class SteamBrowserController:
             raise RuntimeError(f"无法打开页面：{last_error}")
         self._log(f"打开页面：{url}")
 
+    def _goto_friend_claim_page(self, url: str, page_name: str) -> bool:
+        """Open a Steam page without treating slow secondary assets as a navigation failure."""
+        if self._stopped():
+            return False
+        last_error: Exception | None = None
+        for attempt in range(2):
+            self._ensure_page()
+            try:
+                self.page.goto(url, wait_until="commit", timeout=45000)
+                self._log(f"打开{page_name}：{url}")
+                return True
+            except Exception as exc:
+                last_error = exc
+                if self._stopped():
+                    return False
+                message = str(exc)
+                retryable = any(
+                    marker in message
+                    for marker in (
+                        "Timeout",
+                        "ERR_CONNECTION",
+                        "ERR_ABORTED",
+                        "is interrupted by another navigation",
+                    )
+                )
+                if not retryable or attempt == 1:
+                    break
+                self._log(f"{page_name}加载缓慢，等待后重试")
+                time.sleep(2)
+        self._log(f"无法打开{page_name}：{last_error}")
+        return False
+
     def _first_visible(self, selectors: list[str], timeout_ms: int = 12000):
         self._ensure_page()
         deadline = time.time() + timeout_ms / 1000
@@ -879,7 +1195,17 @@ class SteamBrowserController:
         if locator is None:
             self._log(f"没有找到{label}")
             return False
-        locator.click()
+        try:
+            locator.click()
+        except Exception:
+            try:
+                locator.click(force=True)
+            except Exception:
+                try:
+                    locator.evaluate("element => element.click()")
+                except Exception as exc:
+                    self._log(f"点击{label}失败：{exc}")
+                    return False
         self._log(f"已点击{label}")
         return True
 
@@ -2410,13 +2736,1056 @@ class SteamBrowserController:
         self._submit_login()
         self._wait_logged_in()
 
+    @staticmethod
+    def _normalize_friend_invite_link(raw_link: str) -> str:
+        text = str(raw_link or "").strip()
+        match = re.search(
+            r"(?:https?://)?s\.team/p/[A-Za-z0-9]{2,8}-[A-Za-z0-9]{2,8}/[A-Za-z0-9]{4,32}",
+            text,
+            re.IGNORECASE,
+        )
+        if not match:
+            return ""
+        link = match.group(0).rstrip(").,;，；]}>\"'")
+        if link.lower().startswith("s.team/"):
+            link = f"https://{link}"
+        return link
+
+    def _friend_invite_links(self) -> list[str]:
+        self._ensure_page()
+        try:
+            raw_links = self.page.evaluate(
+                """
+                () => {
+                    const found = new Set();
+                    const pattern = /(?:https?:\\/\\/)?s\\.team\\/p\\/[A-Za-z0-9]{2,8}-[A-Za-z0-9]{2,8}\\/[A-Za-z0-9]{4,32}/ig;
+                    const scan = (value) => {
+                        if (!value) return;
+                        for (const match of String(value).matchAll(pattern)) {
+                            found.add(match[0]);
+                        }
+                    };
+                    scan(document.body ? document.body.innerText : "");
+                    scan(document.body ? document.body.textContent : "");
+                    for (const element of document.querySelectorAll('*')) {
+                        scan(element.textContent);
+                        scan(element.getAttribute('href'));
+                        scan(element.getAttribute('value'));
+                        scan(element.getAttribute('data-clipboard-text'));
+                        scan(element.getAttribute('data-copy-text'));
+                        scan(element.getAttribute('data-tooltip-text'));
+                        scan(element.getAttribute('title'));
+                        scan(element.getAttribute('aria-label'));
+                        if ('value' in element) scan(element.value);
+                        if ('href' in element) scan(element.href);
+                    }
+                    for (const script of document.querySelectorAll('script')) {
+                        scan(script.textContent);
+                    }
+                    return Array.from(found);
+                }
+                """
+            )
+        except Exception as exc:
+            self._log(f"读取好友邀请链接失败：{exc}")
+            return []
+
+        links: list[str] = []
+        for raw_link in raw_links or []:
+            link = self._normalize_friend_invite_link(str(raw_link))
+            if not link:
+                continue
+            if link not in links:
+                links.append(link)
+        return links
+
+    def _click_generate_friend_invite_control(self) -> bool:
+        self._ensure_page()
+        selectors = [
+            "#generate_new_link",
+            "#generate_new_invite",
+            ".generate_new_link",
+            "[onclick*='GenerateNewFriendInviteLink']",
+            "[onclick*='GenerateFriendInviteLink']",
+            "[onclick*='CreateFriendInviteLink']",
+            "[onclick*='RegenerateFriendInviteLink']",
+            "[onclick*='InviteLink']",
+            "button:has-text('生成新链接')",
+            "a:has-text('生成新链接')",
+            "[role='button']:has-text('生成新链接')",
+            "button:has-text('生成新的链接')",
+            "a:has-text('生成新的链接')",
+            "[role='button']:has-text('生成新的链接')",
+            "button:has-text('生成新的邀请链接')",
+            "a:has-text('生成新的邀请链接')",
+            "[role='button']:has-text('生成新的邀请链接')",
+            "button:has-text('重新生成')",
+            "a:has-text('重新生成')",
+            "[role='button']:has-text('重新生成')",
+            "button:has-text('Generate a new link')",
+            "a:has-text('Generate a new link')",
+            "[role='button']:has-text('Generate a new link')",
+            "button:has-text('Generate new link')",
+            "a:has-text('Generate new link')",
+            "[role='button']:has-text('Generate new link')",
+        ]
+        if self._click(selectors, "生成新的好友邀请链接"):
+            return True
+        try:
+            clicked = self.page.evaluate(
+                """
+                () => {
+                    const isVisible = (element) => {
+                        const style = window.getComputedStyle(element);
+                        const rect = element.getBoundingClientRect();
+                        return style.visibility !== 'hidden'
+                            && style.display !== 'none'
+                            && rect.width > 0
+                            && rect.height > 0;
+                    };
+                    const pattern = /GenerateNewFriendInviteLink|GenerateFriendInviteLink|CreateFriendInviteLink|RegenerateFriendInviteLink|generate.*(?:invite|link)|new.*(?:invite|link)|生成.*(?:邀请|链接)|重新生成/i;
+                    const candidates = Array.from(document.querySelectorAll('button, a, input, [role="button"], span, div'))
+                        .filter((element) => {
+                            const values = [
+                                element.innerText,
+                                element.textContent,
+                                element.value,
+                                element.id,
+                                element.className,
+                                element.getAttribute('onclick'),
+                                element.getAttribute('title'),
+                                element.getAttribute('aria-label'),
+                                element.getAttribute('data-tooltip-text'),
+                            ].filter(Boolean).join(' ');
+                            return pattern.test(values);
+                        })
+                        .map((element) => element.closest('button, a, input, [role="button"]') || element)
+                        .filter((element, index, all) => all.indexOf(element) === index);
+                    const target = candidates.find(isVisible) || candidates[0];
+                    if (!target) return false;
+                    target.click();
+                    return true;
+                }
+                """
+            )
+            if clicked:
+                self._log("已点击页面中的生成好友链接控件")
+                return True
+        except Exception as exc:
+            self._log(f"点击生成好友链接控件失败：{exc}")
+        return False
+
+    def _generate_friend_invite_link_via_page_api(self) -> str:
+        self._ensure_page()
+        try:
+            result = self.page.evaluate(
+                """
+                async () => {
+                    const collectLinks = (value) => {
+                        const links = [];
+                        const pattern = /(?:https?:\\/\\/)?s\\.team\\/p\\/[A-Za-z0-9]{2,8}-[A-Za-z0-9]{2,8}\\/[A-Za-z0-9]{4,32}/ig;
+                        if (!value) return links;
+                        for (const match of String(value).matchAll(pattern)) {
+                            links.push(match[0]);
+                        }
+                        return links;
+                    };
+                    const functionNames = [
+                        'GenerateNewFriendInviteLink',
+                        'GenerateFriendInviteLink',
+                        'CreateFriendInviteLink',
+                        'RegenerateFriendInviteLink',
+                        'GenerateInviteLink',
+                    ];
+                    for (const functionName of functionNames) {
+                        if (typeof window[functionName] === 'function') {
+                            try {
+                                const value = window[functionName]();
+                                if (value && typeof value.then === 'function') {
+                                    await value;
+                                }
+                                await new Promise((resolve) => setTimeout(resolve, 1200));
+                                const links = collectLinks(document.body ? document.body.innerText : '')
+                                    .concat(collectLinks(document.body ? document.body.textContent : ''));
+                                if (links.length) {
+                                    return { method: functionName, links };
+                                }
+                            } catch (error) {
+                                // Try the next known Steam page function.
+                            }
+                        }
+                    }
+                    const cookieSession = (document.cookie.match(/(?:^|;\\s*)sessionid=([^;]+)/) || [])[1] || '';
+                    const sessionId = window.g_sessionID || decodeURIComponent(cookieSession);
+                    if (!sessionId) {
+                        return { method: 'api', error: 'missing sessionid', links: [] };
+                    }
+                    const endpoints = [
+                        'https://steamcommunity.com/actions/GenerateFriendInviteLink/',
+                        'https://steamcommunity.com/actions/GenerateFriendInviteLink',
+                        'https://steamcommunity.com/actions/GenerateNewFriendInviteLink/',
+                        'https://steamcommunity.com/actions/GenerateNewFriendInviteLink',
+                    ];
+                    let lastResult = { method: 'api', error: 'not attempted', links: [] };
+                    for (const endpoint of endpoints) {
+                        const body = new URLSearchParams();
+                        body.set('sessionid', sessionId);
+                        body.set('sessionID', sessionId);
+                        try {
+                            const response = await fetch(endpoint, {
+                                method: 'POST',
+                                credentials: 'include',
+                                headers: {
+                                    'Accept': 'application/json, text/javascript, */*; q=0.01',
+                                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                                    'X-Requested-With': 'XMLHttpRequest',
+                                },
+                                body: body.toString(),
+                            });
+                            const text = await response.text();
+                            const links = collectLinks(text);
+                            lastResult = {
+                                method: endpoint,
+                                ok: response.ok,
+                                status: response.status,
+                                links,
+                                text: text.slice(0, 500),
+                            };
+                            if (links.length) return lastResult;
+                        } catch (error) {
+                            lastResult = { method: endpoint, error: String(error), links: [] };
+                        }
+                    }
+                    return lastResult;
+                }
+                """
+            )
+        except Exception as exc:
+            self._log(f"调用Steam生成好友链接接口失败：{exc}")
+            return ""
+
+        links = result.get("links") if isinstance(result, dict) else []
+        for raw_link in links or []:
+            link = self._normalize_friend_invite_link(str(raw_link))
+            if link:
+                self._log("已通过Steam页面接口生成新的好友邀请链接")
+                return link
+        if isinstance(result, dict):
+            self._log(
+                "Steam生成好友链接接口未返回可识别链接"
+                f"（method={result.get('method')} status={result.get('status')} error={result.get('error', '')}）"
+            )
+        return ""
+
+    def _wait_for_new_friend_invite_link(
+        self,
+        existing_links: set[str],
+        timeout_seconds: int = 45,
+    ) -> str:
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline and not self._stopped():
+            for link in self._friend_invite_links():
+                if link not in existing_links:
+                    return link
+            time.sleep(0.5)
+        return ""
+
+    def _generate_new_friend_invite_link(self, existing_links: set[str]) -> str:
+        if self._click_generate_friend_invite_control():
+            link = self._wait_for_new_friend_invite_link(existing_links, timeout_seconds=20)
+            if link:
+                return link
+        link = self._generate_friend_invite_link_via_page_api()
+        if link and link not in existing_links:
+            return link
+        if link:
+            existing_links.add(link)
+        self.page.reload(wait_until="commit", timeout=45000)
+        return self._wait_for_new_friend_invite_link(existing_links, timeout_seconds=20)
+
+    def collect_friend_invite_links(self, task: Task) -> bool:
+        if not self._goto_friend_claim_page(STEAM_FRIENDS_ADD_URL, "好友添加页"):
+            self.app.ui_friend_claim_issue(task.id, "好友添加页无法打开，请检查网络后重试")
+            return False
+        friend_link_1 = self._wait_for_new_friend_invite_link(set())
+        if not friend_link_1:
+            self.app.ui_friend_claim_issue(
+                task.id,
+                "未读取到Steam快速邀请链接，请检查好友添加页面是否已加载",
+            )
+            return False
+
+        # Store the first link before requesting a replacement link.
+        self.app.ui_friend_claim_link_saved(task.id, 1, friend_link_1)
+        friend_link_2 = self._generate_new_friend_invite_link({friend_link_1})
+        if not friend_link_2:
+            self.app.ui_friend_claim_issue(
+                task.id,
+                "生成新链接后未读取到第二条不同的好友邀请链接，已保留当前页面供人工处理",
+            )
+            return False
+
+        self.app.ui_friend_claim_links_collected(task.id, friend_link_1, friend_link_2)
+        self._log("已采集两条不同的Steam好友邀请链接")
+        return True
+
+    def _prepare_friend_claim_login(self) -> bool:
+        """Go straight to login, logging out an existing Steam session only when needed."""
+        if not self._goto_friend_claim_page(STEAM_LOGIN_URL, "Steam登录页"):
+            return False
+        session_marker = self._first_visible(
+            ["#account_pulldown", "a[href*='logout']", "input[type='password']"],
+            timeout_ms=15000,
+        )
+        if session_marker is not None and self._is_logged_in():
+            self._log("检测到已有登录账号，先通过右上角菜单退出")
+            if not self.logout_by_menu():
+                return False
+            return self._goto_friend_claim_page(STEAM_LOGIN_URL, "Steam登录页")
+        return True
+
+    def _login_friend_claim_task(self, task: Task) -> bool:
+        if not self._prepare_friend_claim_login():
+            self.app.ui_friend_claim_issue(task.id, "开始新账号前无法确认登出或登录页无法打开")
+            return False
+        if not self._fill_login_credentials(task.steam_account, task.steam_password):
+            self.app.ui_friend_claim_issue(task.id, "登录表单填写失败")
+            return False
+        self._submit_login()
+        if not self._wait_logged_in():
+            self.app.ui_friend_claim_issue(task.id, "登录结果未确认")
+            return False
+        if not self._verify_task_identity(task):
+            self.app.ui_friend_claim_issue(task.id, "账号省市/店名核心身份核对失败")
+            return False
+        return True
+
+    def start_friend_claim_account(self, task: Task) -> bool:
+        if not self._login_friend_claim_task(task):
+            return False
+        return self.collect_friend_invite_links(task)
+
+    def _friend_claim_product(self, task: Task) -> dict | None:
+        product = resolve_game_product(task.game_name)
+        if product is None:
+            self.app.ui_friend_game_claim_issue(task.id, f"未配置可核对的游戏产品标识：{task.game_name}")
+        return product
+
+    def _verify_friend_game_asset(self, task: Task, status_text: str) -> Path | None:
+        product = self._friend_claim_product(task)
+        if product is None:
+            return None
+        self._goto(STEAM_LICENSES_URL)
+        if self._stopped():
+            return None
+        time.sleep(2)
+        body_text = (self.page.locator("body").inner_text(timeout=7000) or "").strip()
+        if not product_in_text(product, body_text):
+            self._log(f"资产清单中未找到《{product['official_name']}》")
+            return None
+        return self._capture_page(task, status_text)
+
+    def _click_notification_bell(self) -> bool:
+        coordinate_selectors = [
+            "[data-featuretarget='green-envelope']",
+            "#header_notification_link",
+            "#header_notification_area",
+            "#header_notification_count",
+            ".header_notification_btn",
+        ]
+        for selector in coordinate_selectors:
+            try:
+                locator = self.page.locator(selector).first
+                if locator.count() <= 0 or not locator.is_visible(timeout=500):
+                    continue
+                box = locator.bounding_box()
+                if not box:
+                    continue
+                x = box["x"] + box["width"] / 2
+                y = box["y"] + box["height"] / 2
+                self.page.mouse.move(x, y)
+                time.sleep(0.15)
+                self.page.mouse.down()
+                time.sleep(0.08)
+                self.page.mouse.up()
+                self._log(f"已点击通知小铃铛坐标：{selector}")
+                time.sleep(1.2)
+                return True
+            except Exception as exc:
+                self._log(f"坐标点击通知小铃铛失败（{selector}）：{exc}")
+
+        try:
+            clicked = self.page.evaluate(
+                """
+                () => {
+                    const visible = (element) => {
+                        const style = window.getComputedStyle(element);
+                        const rect = element.getBoundingClientRect();
+                        return style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && rect.width > 0
+                            && rect.height > 0;
+                    };
+                    const candidates = [
+                        document.querySelector('[data-featuretarget="green-envelope"]'),
+                        document.querySelector('#header_notification_link'),
+                        document.querySelector('#header_notification_area'),
+                        document.querySelector('#header_notification_count'),
+                        ...Array.from(document.querySelectorAll('a, button, [role="button"], div, span')).filter((element) => {
+                            const values = [
+                                element.id,
+                                element.className,
+                                element.href,
+                                element.getAttribute('aria-label'),
+                                element.getAttribute('title'),
+                                element.getAttribute('data-tooltip-text'),
+                                element.innerText,
+                            ].filter(Boolean).join(' ');
+                            return /notification|通知|bell|铃铛|green-envelope/i.test(values);
+                        }),
+                    ].filter(Boolean);
+                    const target = candidates
+                        .map((element) => element.closest('a, button, [role="button"]') || element)
+                        .find(visible);
+                    if (!target) return false;
+                    target.click();
+                    return true;
+                }
+                """
+            )
+            if clicked:
+                self._log("已通过页面脚本点击通知小铃铛")
+                return True
+        except Exception as exc:
+            self._log(f"脚本点击通知小铃铛失败：{exc}")
+
+        clicked = self._click(
+            [
+                "#header_notification_link",
+                "#header_notification_area",
+                "#header_notification_count",
+                ".header_notification_btn",
+                "a[href*='/notifications']",
+                "a[href*='notifications']",
+                "button[aria-label*='通知']",
+                "button[aria-label*='Notification']",
+                "[aria-label*='通知']",
+                "[aria-label*='Notification']",
+                "[class*='notification'][class*='bell']",
+                "[class*='NotificationBell']",
+                "[class*='notification']",
+                "[class*='NotificationBell']",
+            ],
+            "通知小铃铛",
+        )
+        if clicked:
+            return True
+        return False
+
+    def _click_visible_text_candidate(
+        self,
+        pattern: str,
+        label: str,
+        exclude_pattern: str = "",
+        container_selector: str = "",
+    ) -> bool:
+        self._ensure_page()
+        try:
+            result = self.page.evaluate(
+                """
+                ({ pattern, excludePattern, containerSelector }) => {
+                    const re = new RegExp(pattern, 'i');
+                    const exclude = excludePattern ? new RegExp(excludePattern, 'i') : null;
+                    const root = containerSelector
+                        ? (document.querySelector(containerSelector) || document)
+                        : document;
+                    const visible = (element) => {
+                        const style = window.getComputedStyle(element);
+                        const rect = element.getBoundingClientRect();
+                        return style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && rect.width > 0
+                            && rect.height > 0;
+                    };
+                    const textOf = (element) => [
+                        element.innerText,
+                        element.textContent,
+                        element.value,
+                        element.getAttribute('title'),
+                        element.getAttribute('aria-label'),
+                    ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                    const candidates = Array.from(root.querySelectorAll('a, button, input, [role="button"], div, span'))
+                        .map((element) => element.closest('a, button, input, [role="button"]') || element)
+                        .filter((element, index, all) => all.indexOf(element) === index)
+                        .filter((element) => visible(element))
+                        .map((element) => ({ element, text: textOf(element) }))
+                        .filter((item) => item.text && re.test(item.text) && !(exclude && exclude.test(item.text)));
+                    const target = candidates
+                        .sort((a, b) => a.text.length - b.text.length)[0];
+                    if (!target) return null;
+                    target.element.scrollIntoView({ block: 'center', inline: 'center' });
+                    const rect = target.element.getBoundingClientRect();
+                    return {
+                        x: rect.left + rect.width / 2,
+                        y: rect.top + rect.height / 2,
+                        text: target.text,
+                    };
+                }
+                """,
+                {
+                    "pattern": pattern,
+                    "excludePattern": exclude_pattern,
+                    "containerSelector": container_selector,
+                },
+            )
+        except Exception as exc:
+            self._log(f"查找{label}失败：{exc}")
+            return False
+        if not result:
+            self._log(f"没有找到{label}")
+            return False
+        try:
+            self.page.mouse.click(float(result["x"]), float(result["y"]))
+        except Exception:
+            try:
+                self.page.evaluate(
+                    """
+                    ({ pattern, excludePattern, containerSelector }) => {
+                        const re = new RegExp(pattern, 'i');
+                        const exclude = excludePattern ? new RegExp(excludePattern, 'i') : null;
+                        const root = containerSelector
+                            ? (document.querySelector(containerSelector) || document)
+                            : document;
+                        const visible = (element) => {
+                            const style = window.getComputedStyle(element);
+                            const rect = element.getBoundingClientRect();
+                            return style.display !== 'none'
+                                && style.visibility !== 'hidden'
+                                && rect.width > 0
+                                && rect.height > 0;
+                        };
+                        const textOf = (element) => [
+                            element.innerText,
+                            element.textContent,
+                            element.value,
+                            element.getAttribute('title'),
+                            element.getAttribute('aria-label'),
+                        ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                        const target = Array.from(root.querySelectorAll('a, button, input, [role="button"], div, span'))
+                            .map((element) => element.closest('a, button, input, [role="button"]') || element)
+                            .filter((element, index, all) => all.indexOf(element) === index)
+                            .filter((element) => visible(element))
+                            .map((element) => ({ element, text: textOf(element) }))
+                            .filter((item) => item.text && re.test(item.text) && !(exclude && exclude.test(item.text)))
+                            .sort((a, b) => a.text.length - b.text.length)[0]?.element;
+                        if (!target) return false;
+                        target.click();
+                        return true;
+                    }
+                    """,
+                    {
+                        "pattern": pattern,
+                        "excludePattern": exclude_pattern,
+                        "containerSelector": container_selector,
+                    },
+                )
+            except Exception as exc:
+                self._log(f"点击{label}失败：{exc}")
+                return False
+        self._log(f"已点击{label}：{result.get('text', '')[:80]}")
+        return True
+
+    def _click_gift_notification_candidate(self, product: dict) -> bool:
+        self._ensure_page()
+        try:
+            result = self.page.evaluate(
+                """
+                () => {
+                    const visible = (element) => {
+                        const style = window.getComputedStyle(element);
+                        const rect = element.getBoundingClientRect();
+                        return style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && rect.width > 0
+                            && rect.height > 0;
+                    };
+                    const textOf = (element) => [
+                        element.innerText,
+                        element.textContent,
+                        element.getAttribute('title'),
+                        element.getAttribute('aria-label'),
+                    ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                    const dropdowns = Array.from(document.querySelectorAll('body *'))
+                        .filter(visible)
+                        .map((element) => ({ element, text: textOf(element), rect: element.getBoundingClientRect() }))
+                        .filter((item) => /通知|Notification/i.test(item.text)
+                            && /新礼物|new\\s+gift/i.test(item.text)
+                            && item.rect.width >= 240
+                            && item.rect.height >= 80)
+                        .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
+                    const dropdown = dropdowns[0]?.element || document.querySelector('#header_notification_dropdown') || document;
+                    const candidates = Array.from(dropdown.querySelectorAll('a, button, [role="button"], div, span'))
+                        .map((element) => {
+                            const clickable = element.closest('a, button, [role="button"]') || element;
+                            return { element: clickable, text: textOf(clickable), rect: clickable.getBoundingClientRect() };
+                        })
+                        .filter((item, index, all) => all.findIndex((other) => other.element === item.element) === index)
+                        .filter((item) => visible(item.element))
+                        .filter((item) => /新\\s*礼物|new\\s+gift/i.test(item.text))
+                        .filter((item) => !/礼物卡|库存|物品|商品|inventory|item|gift\\s*card/i.test(item.text));
+                    const target = candidates
+                        .sort((a, b) => {
+                            const aRow = a.rect.width >= 200 && a.rect.height >= 25 ? 0 : 1;
+                            const bRow = b.rect.width >= 200 && b.rect.height >= 25 ? 0 : 1;
+                            if (aRow !== bRow) return aRow - bRow;
+                            return a.text.length - b.text.length;
+                        })[0];
+                    if (target) {
+                        target.element.scrollIntoView({ block: 'center', inline: 'center' });
+                        const rect = target.element.getBoundingClientRect();
+                        return {
+                            found: true,
+                            fallback: false,
+                            x: rect.left + rect.width / 2,
+                            y: rect.top + rect.height / 2,
+                            text: target.text,
+                        };
+                    }
+                    const visibleDropdown = dropdowns[0];
+                    if (visibleDropdown) {
+                        const rect = visibleDropdown.rect;
+                        return {
+                            found: true,
+                            fallback: true,
+                            x: rect.left + rect.width / 2,
+                            y: rect.top + 78,
+                            text: visibleDropdown.text.slice(0, 160),
+                        };
+                    }
+                    return { found: false };
+                }
+                """
+            )
+        except Exception as exc:
+            self._log(f"查找通知下拉中的新礼物失败：{exc}")
+            return False
+        clicked = bool(result and result.get("found"))
+        if clicked:
+            try:
+                self.page.mouse.click(float(result["x"]), float(result["y"]))
+                label = "通知下拉第一条新礼物" if result.get("fallback") else "通知下拉中的新礼物"
+                self._log(f"已点击{label}：{str(result.get('text', ''))[:100]}")
+            except Exception as exc:
+                self._log(f"点击通知下拉中的新礼物失败：{exc}")
+                return False
+            try:
+                self.page.wait_for_load_state("domcontentloaded", timeout=10000)
+            except Exception:
+                pass
+            time.sleep(2)
+        else:
+            self._log("没有找到通知下拉中的新礼物")
+        return clicked
+
+    def _open_gift_notification_page(self, task: Task, product: dict) -> bool:
+        candidate_urls = []
+        profile_link = (task.profile_link or "").strip().rstrip("/")
+        if profile_link:
+            candidate_urls.append(f"{profile_link}/inventory/#pending_gifts")
+        candidate_urls.append(STEAM_PENDING_GIFTS_URL)
+        for url in candidate_urls:
+            if self._stopped():
+                return False
+            if not self._goto_friend_claim_page(url, "待收礼物页面"):
+                continue
+            time.sleep(5)
+            try:
+                body_text = (self.page.locator("body").inner_text(timeout=8000) or "").strip()
+            except Exception:
+                body_text = ""
+            if (
+                "接收礼物" in body_text
+                or "接受礼物" in body_text
+                or "领取礼物" in body_text
+                or "添加至我的库" in body_text
+                or "添加到我的库" in body_text
+                or "pending gift" in body_text.lower()
+                or "accept gift" in body_text.lower()
+            ):
+                self._log(f"已打开待收礼物页面：{url}")
+                return True
+            self._log(f"待收礼物页面已打开但未识别到待处理礼物：{url}")
+        return False
+
+    def _current_gift_page_matches_product(self, product: dict) -> bool:
+        try:
+            body_text = (self.page.locator("body").inner_text(timeout=5000) or "").strip()
+        except Exception:
+            body_text = ""
+        if product_in_text(product, body_text):
+            return True
+        lowered = body_text.lower()
+        if "礼物" in body_text or "赠礼" in body_text or "gift" in lowered:
+            self._log(f"当前礼物页面未识别到目标游戏《{product['official_name']}》，停止自动领取")
+        return False
+
+    def _click_positive_gift_claim_control(self) -> str:
+        self._ensure_page()
+        exact_steps: list[tuple[str, str, str]] = [
+            (
+                r"^\s*添加(至|到)我的库\s*$|^\s*添加(至|到)库\s*$|^\s*Add to my library\s*$",
+                "添加至我的库按钮",
+                "添加至我的库",
+            ),
+            (
+                r"^\s*(接收|接受|领取|收下)礼物\s*$|^\s*Accept Gift\s*$|^\s*Redeem Gift\s*$",
+                "接收礼物按钮",
+                "接收礼物",
+            ),
+        ]
+        for pattern, label, action in exact_steps:
+            if self._click_visible_text_candidate(
+                pattern,
+                label,
+                exclude_pattern=r"拒绝|拒收|取消|Decline|Reject|Cancel",
+            ):
+                return action
+        selectors = [
+            "button:has-text('添加到我的库')",
+            "a:has-text('添加到我的库')",
+            "button:has-text('添加至我的库')",
+            "a:has-text('添加至我的库')",
+            "button:has-text('添加到库')",
+            "a:has-text('添加到库')",
+            "button:has-text('Add to my library')",
+            "a:has-text('Add to my library')",
+            "button:has-text('接受礼物')",
+            "a:has-text('接受礼物')",
+            "button:has-text('接收礼物')",
+            "a:has-text('接收礼物')",
+            "button:has-text('领取礼物')",
+            "a:has-text('领取礼物')",
+            "button:has-text('收下礼物')",
+            "a:has-text('收下礼物')",
+            "button:has-text('Accept Gift')",
+            "a:has-text('Accept Gift')",
+            "button:has-text('Redeem Gift')",
+            "a:has-text('Redeem Gift')",
+            "input[value*='接受']",
+            "input[value*='领取']",
+            "[onclick*='AcceptGift']",
+            "[onclick*='RedeemGift']",
+        ]
+        if self._click(selectors, "礼物领取确认按钮"):
+            return "礼物领取确认"
+        try:
+            result = self.page.evaluate(
+                """
+                () => {
+                    const addPattern = /添加.{0,8}(我的)?库|Add to.{0,12}Library/i;
+                    const acceptPattern = /接受礼物|接收礼物|领取礼物|收下礼物|Accept Gift|Redeem Gift/i;
+                    const negative = /拒绝|拒收|退回|取消|删除|Decline|Reject|Return|Cancel|Remove|Delete/i;
+                    const visible = (element) => {
+                        const style = window.getComputedStyle(element);
+                        const rect = element.getBoundingClientRect();
+                        return style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && rect.width > 0
+                            && rect.height > 0
+                            && !element.disabled;
+                    };
+                    const textOf = (element) => [
+                        element.innerText,
+                        element.textContent,
+                        element.value,
+                        element.id,
+                        element.className,
+                        element.getAttribute('onclick'),
+                        element.getAttribute('title'),
+                        element.getAttribute('aria-label'),
+                    ].filter(Boolean).join(' ');
+                    const candidates = Array.from(document.querySelectorAll('button, a, input, [role="button"], span, div'))
+                        .map((element) => element.closest('button, a, input, [role="button"]') || element)
+                        .filter((element, index, all) => all.indexOf(element) === index)
+                        .filter((element) => visible(element))
+                        .map((element) => {
+                            const text = textOf(element);
+                            const action = addPattern.test(text) ? '添加至我的库' : (acceptPattern.test(text) ? '接收礼物' : '');
+                            return { element, text, action };
+                        });
+                    const target = candidates
+                        .filter((item) => item.action && !negative.test(item.text))
+                        .sort((a, b) => {
+                            const ap = a.action === '添加至我的库' ? 0 : 1;
+                            const bp = b.action === '添加至我的库' ? 0 : 1;
+                            return ap - bp;
+                        })[0];
+                    if (!target) return false;
+                    target.element.scrollIntoView({ block: 'center', inline: 'center' });
+                    target.element.click();
+                    return { clicked: true, action: target.action };
+                }
+                """
+            )
+            if result and result.get("clicked"):
+                action = str(result.get("action") or "礼物领取确认")
+                self._log(f"已点击礼物领取确认控件：{action}")
+                return action
+        except Exception as exc:
+            self._log(f"点击礼物领取控件失败：{exc}")
+        return ""
+
+    def _select_add_to_library_option(self) -> None:
+        try:
+            self.page.evaluate(
+                """
+                () => {
+                    const pattern = /添加.{0,8}(我的)?库|add to.{0,12}library/i;
+                    for (const label of Array.from(document.querySelectorAll('label'))) {
+                        const text = [label.innerText, label.textContent].filter(Boolean).join(' ');
+                        if (!pattern.test(text)) continue;
+                        const target = label.control || label.querySelector('input');
+                        if (target && !target.checked) target.click();
+                        else label.click();
+                        break;
+                    }
+                }
+                """
+            )
+        except Exception:
+            pass
+
+    def _claim_gift_on_current_page(self, task: Task, product: dict) -> bool:
+        clicked_any = False
+        clicked_add_to_library = False
+        success_markers = [
+            "已添加到您的库",
+            "已加入您的库",
+            "已经在您的库",
+            "添加到了您的 Steam 库",
+            "added to your library",
+            "already in your library",
+            "successfully redeemed",
+            "gift has been accepted",
+            ]
+        for _ in range(6):
+            if self._stopped():
+                return False
+            try:
+                body_text = (self.page.locator("body").inner_text(timeout=5000) or "").strip()
+            except Exception:
+                body_text = ""
+            lowered = body_text.lower()
+            if any(marker.lower() in lowered for marker in success_markers):
+                self._log("页面显示礼物已领取")
+                return True
+            self._select_add_to_library_option()
+            action = self._click_positive_gift_claim_control()
+            if action:
+                clicked_any = True
+                if "库" in action or "library" in action.lower():
+                    clicked_add_to_library = True
+                try:
+                    self.page.wait_for_load_state("domcontentloaded", timeout=12000)
+                except Exception:
+                    pass
+                time.sleep(3)
+                continue
+            if clicked_add_to_library:
+                return True
+            if clicked_any:
+                time.sleep(2)
+                continue
+            if "gift" in lowered or "礼物" in body_text or "赠礼" in body_text:
+                self._log("礼物页面已打开，但未找到可点击的领取控件")
+                return False
+            time.sleep(1)
+        return clicked_any
+
+    def claim_friend_game_gift(self, task: Task) -> bool:
+        product = self._friend_claim_product(task)
+        if product is None:
+            return False
+        if not self._login_friend_claim_task(task):
+            return False
+
+        if not self._open_gift_notification_page(task, product):
+            already_path = self._verify_friend_game_asset(task, "自动游戏领取-未找到通知但资产已存在")
+            if already_path is not None:
+                if not self.logout_by_menu():
+                    self.app.ui_friend_game_claim_issue(task.id, "未找到通知但资产已存在，登出未确认")
+                    return False
+                self.app.ui_friend_game_claim_finished(
+                    task.id,
+                    f"未找到礼物通知，但资产清单已存在《{product['official_name']}》",
+                    already_path,
+                )
+                return True
+            self.app.ui_friend_game_claim_issue(task.id, "未找到礼物通知，且资产清单尚未出现目标游戏")
+            return False
+        self.app.ui_friend_game_claim_step(task.id, "通知", "已打开礼物通知或礼物领取页面")
+
+        if not self._claim_gift_on_current_page(task, product):
+            self.app.ui_friend_game_claim_issue(task.id, "礼物页面未能自动完成领取，请人工检查当前页面")
+            return False
+
+        path = self._verify_friend_game_asset(task, "自动游戏领取-资产已确认")
+        if path is None:
+            self.app.ui_friend_game_claim_issue(
+                task.id,
+                f"领取后资产清单中未找到《{product['official_name']}》",
+            )
+            return False
+        if not self.logout_by_menu():
+            self.app.ui_friend_game_claim_issue(task.id, "领取后登出未确认")
+            return False
+        self.app.ui_friend_game_claim_finished(
+            task.id,
+            f"已确认《{product['official_name']}》进入账号资产列表",
+            path,
+        )
+        return True
+
+    def full_auto_friend_game_claim(self, tasks: list[Task]) -> None:
+        self.app.ui_friend_game_claim_batch_started(len(tasks))
+        stopped = False
+        for task_number, task in enumerate(tasks, start=1):
+            if not self._wait_auto_gate():
+                stopped = True
+                break
+            self.app.ui_friend_game_claim_batch_task_started(task, task_number, len(tasks))
+            try:
+                claimed = self.claim_friend_game_gift(task)
+            except Exception as exc:
+                self._log(f"自动游戏领取异常：{exc}")
+                self.app.ui_friend_game_claim_issue(task.id, f"自动游戏领取异常：{exc}")
+                claimed = False
+
+            if self._stopped():
+                stopped = True
+                break
+
+            if not claimed:
+                try:
+                    if self._is_logged_in():
+                        self.logout_by_menu()
+                except Exception as exc:
+                    self._log(f"自动游戏领取异常后登出失败：{exc}")
+                    stopped = True
+                    break
+            time.sleep(0.75)
+
+        self.app.ui_friend_game_claim_batch_finished(stopped or self._stopped())
+
+    def open_friend_claim_page(self, task: Task) -> bool:
+        if not task.friend_link_1 or not task.friend_link_2:
+            self.app.ui_friend_claim_issue(task.id, "尚未采集两条好友邀请链接，不能打开提货流程")
+            return False
+        url = str(task.pickup_url or "").strip()
+        if not url:
+            self.app.ui_friend_claim_issue(task.id, "任务缺少提货网址，无法打开提货页面")
+            return False
+        if not re.match(r"^https?://", url, re.IGNORECASE):
+            url = f"https://{url}"
+        self._goto(url)
+        if self._stopped():
+            return False
+        self.app.ui_friend_claim_ready(task.id, "已打开提货页；请核对页面字段后完成本次提货")
+        return True
+
+    def capture_friend_claim_result(self, task: Task) -> bool:
+        if self._stopped():
+            return False
+        path = self._capture_page(task, "提货结果")
+        self.app.ui_friend_claim_result_captured(task.id, path)
+        return True
+
+    def finish_friend_claim_and_logout(self, task: Task) -> bool:
+        if not self.logout_by_menu():
+            self.app.ui_friend_claim_issue(task.id, "提货完成后账号登出未确认")
+            return False
+        self.app.ui_friend_claim_finished(task.id)
+        return True
+
+    def full_auto_friend_claim_collection(self, tasks: list[Task]) -> None:
+        self.app.ui_friend_claim_batch_started(len(tasks))
+        stopped = False
+        for task_number, task in enumerate(tasks, start=1):
+            if not self._wait_auto_gate():
+                stopped = True
+                break
+            self.app.ui_friend_claim_batch_task_started(task, task_number, len(tasks))
+
+            try:
+                collected = self.start_friend_claim_account(task)
+            except Exception as exc:
+                self._log(f"好友链接采集异常：{exc}")
+                self.app.ui_friend_claim_issue(task.id, f"好友链接采集异常：{exc}")
+                collected = False
+
+            if self._stopped():
+                stopped = True
+                break
+
+            try:
+                logged_out = not self._is_logged_in() or self.logout_by_menu()
+            except Exception as exc:
+                self._log(f"好友链接采集后登出异常：{exc}")
+                logged_out = False
+
+            if collected and logged_out:
+                self.app.ui_friend_claim_collection_finished(task.id)
+            elif not logged_out:
+                self.app.ui_friend_claim_issue(task.id, "好友链接采集后账号登出未确认")
+
+            if self._stopped():
+                stopped = True
+                break
+            time.sleep(0.75)
+
+        self.app.ui_friend_claim_batch_finished(stopped or self._stopped())
+
     def logout_by_menu(self) -> bool:
-        opened = self._click(["#account_pulldown", ".pulldown.global_action_link"], "右上角账号菜单")
-        time.sleep(1)
-        logout = self._click(["a[href*='logout']", "text=Logout", "text=Sign out", "text=退出"], "退出账户")
-        if not opened or not logout:
+        account_menu = self._first_visible(
+            ["#account_pulldown", ".pulldown.global_action_link"],
+            timeout_ms=12000,
+        )
+        if account_menu is None:
+            self._log("未找到右上角账号菜单，无法确认退出")
+            return False
+        try:
+            account_menu.click(no_wait_after=True)
+        except Exception:
+            try:
+                account_menu.evaluate("element => element.click()")
+            except Exception:
+                self._log("未能点击右上角账号菜单")
+                return False
+        self._log("已点击右上角账号菜单")
+        time.sleep(0.5)
+        logout = self._first_visible(
+            [
+                "a[href*='logout']",
+                "a.popup_menu_item:has-text('退出账户')",
+                "a.popup_menu_item:has-text('退出')",
+                "text=Logout",
+                "text=Sign out",
+            ],
+            timeout_ms=12000,
+        )
+        if logout is None:
             self._log("未能自动完成菜单退出，请人工点击右上角账号菜单退出")
             return False
+        try:
+            # Steam's logout item triggers a navigation; do not wait for every asset to finish.
+            logout.evaluate("element => element.click()")
+        except Exception:
+            try:
+                logout.click(no_wait_after=True)
+            except Exception:
+                self._log("未能点击退出账户")
+                return False
+        self._log("已点击退出账户")
         deadline = time.time() + 20
         while time.time() < deadline and not self._stopped():
             time.sleep(0.5)
@@ -2446,10 +3815,16 @@ class SteamTaskAssistant:
         self.suppress_selection_event = False
         self.filter_mode_var = StringVar(value="兑换码兑换")
         self.auto_limit_var = IntVar(value=3)
+        self.friend_claim_limit_var = IntVar(value=58)
+        self.friend_claim_use_system_proxy_var = BooleanVar(
+            value=os.environ.get("STEAM_ASSISTANT_USE_SYSTEM_PROXY", "").lower()
+            in {"1", "true", "yes"}
+        )
         self.auto_progress_var = StringVar(value="全自动：未启动")
         self.purchase_progress_var = StringVar(value="购买流程：未开始")
         self.activation_progress_var = StringVar(value="激活流程：未开始")
         self.playtime_progress_var = StringVar(value="游玩检测：未开始")
+        self.friend_claim_progress_var = StringVar(value="好友码提货：未开始")
         self.current_var = StringVar(value="当前账号：无")
         self.next_var = StringVar(value="下一个账号：无")
         self.status_var = StringVar(value="就绪")
@@ -2459,7 +3834,7 @@ class SteamTaskAssistant:
         self.root.protocol("WM_DELETE_WINDOW", self.close_app)
 
     def _build_ui(self) -> None:
-        self.root.title("Steam账号兑换/激活/购买/游玩检测助手")
+        self.root.title("Steam账号兑换/激活/购买/游玩检测/好友码提货助手")
         self.root.geometry("1360x820")
         self.root.minsize(1180, 720)
 
@@ -2473,7 +3848,7 @@ class SteamTaskAssistant:
         mode_box = ttk.Combobox(
             toolbar,
             textvariable=self.filter_mode_var,
-            values=("兑换码兑换", "激活码激活", "游戏购买", "游玩时间检测", "全部模式"),
+            values=("兑换码兑换", "激活码激活", "游戏购买", "游玩时间检测", "好友码提货", "全部模式"),
             state="readonly",
             width=12,
         )
@@ -2615,6 +3990,118 @@ class SteamTaskAssistant:
         ttk.Label(playtime_row_two, text="0=全部").pack(side=LEFT, padx=4)
         ttk.Label(playtime_row_two, textvariable=self.playtime_progress_var).pack(side=LEFT, padx=16)
 
+        self.friend_claim_box = ttk.LabelFrame(right, text="好友码提货（半自动）", padding=8)
+        friend_claim_row_one = ttk.Frame(self.friend_claim_box)
+        friend_claim_row_one.pack(fill=X)
+        ttk.Button(
+            friend_claim_row_one,
+            text="1 一键登录并采集两条好友链接",
+            command=self.friend_claim_login_collect,
+        ).pack(side=LEFT, padx=4, pady=4)
+        ttk.Button(
+            friend_claim_row_one,
+            text="2 打开提货页",
+            command=self.friend_claim_open_page,
+        ).pack(side=LEFT, padx=4, pady=4)
+        ttk.Button(
+            friend_claim_row_one,
+            text="3 提货结果截图",
+            command=self.friend_claim_capture_result,
+        ).pack(side=LEFT, padx=4, pady=4)
+        ttk.Button(
+            friend_claim_row_one,
+            text="4 完成提货并登出",
+            command=self.friend_claim_finish_logout,
+        ).pack(side=LEFT, padx=4, pady=4)
+        friend_claim_row_two = ttk.Frame(self.friend_claim_box)
+        friend_claim_row_two.pack(fill=X)
+        ttk.Button(friend_claim_row_two, text="复制好友链接1", command=lambda: self.copy_friend_link(1)).pack(side=LEFT, padx=4, pady=4)
+        ttk.Button(friend_claim_row_two, text="复制好友链接2", command=lambda: self.copy_friend_link(2)).pack(side=LEFT, padx=4, pady=4)
+        ttk.Button(friend_claim_row_two, text="复制提货码", command=self.copy_pickup_code).pack(side=LEFT, padx=4, pady=4)
+        ttk.Button(friend_claim_row_two, text="标记异常", command=self.mark_exception).pack(side=LEFT, padx=4, pady=4)
+        ttk.Button(friend_claim_row_two, text="跳过当前账号", command=self.skip_current_account).pack(side=LEFT, padx=4, pady=4)
+        ttk.Label(friend_claim_row_two, textvariable=self.friend_claim_progress_var).pack(side=LEFT, padx=16)
+
+        self.friend_claim_full_auto_box = ttk.LabelFrame(
+            right,
+            text="58家好友链接全自动采集",
+            padding=8,
+        )
+        friend_claim_auto_row_one = ttk.Frame(self.friend_claim_full_auto_box)
+        friend_claim_auto_row_one.pack(fill=X)
+        ttk.Button(
+            friend_claim_auto_row_one,
+            text="导入/刷新红色沙漠58家任务",
+            command=self.import_friend_claim_tasks,
+        ).pack(side=LEFT, padx=4, pady=4)
+        ttk.Button(
+            friend_claim_auto_row_one,
+            text="开始全自动采集",
+            command=self.start_full_auto_friend_claim,
+        ).pack(side=LEFT, padx=4, pady=4)
+        ttk.Button(friend_claim_auto_row_one, text="暂停", command=self.pause_full_auto).pack(side=LEFT, padx=4, pady=4)
+        ttk.Button(
+            friend_claim_auto_row_one,
+            text="继续",
+            command=self.resume_full_auto_friend_claim,
+        ).pack(side=LEFT, padx=4, pady=4)
+        ttk.Button(
+            friend_claim_auto_row_one,
+            text="停止并保留现场",
+            command=self.stop_full_auto,
+        ).pack(side=LEFT, padx=4, pady=4)
+        ttk.Label(friend_claim_auto_row_one, text="本次账号数").pack(side=LEFT, padx=(16, 4))
+        ttk.Spinbox(
+            friend_claim_auto_row_one,
+            from_=0,
+            to=999,
+            textvariable=self.friend_claim_limit_var,
+            width=5,
+        ).pack(side=LEFT, padx=4)
+        ttk.Label(friend_claim_auto_row_one, text="0=全部").pack(side=LEFT, padx=4)
+        ttk.Checkbutton(
+            friend_claim_auto_row_one,
+            text="使用系统代理",
+            variable=self.friend_claim_use_system_proxy_var,
+        ).pack(side=LEFT, padx=(12, 4))
+        friend_claim_auto_row_two = ttk.Frame(self.friend_claim_full_auto_box)
+        friend_claim_auto_row_two.pack(fill=X)
+        ttk.Label(
+            friend_claim_auto_row_two,
+            text="流程：登录 -> 两条快速邀请链接 -> 登出 -> 下一个账号；异常账号记录后继续。",
+        ).pack(side=LEFT, padx=4, pady=2)
+        ttk.Label(friend_claim_auto_row_two, textvariable=self.friend_claim_progress_var).pack(
+            side=LEFT,
+            padx=16,
+        )
+        friend_game_claim_row = ttk.Frame(self.friend_claim_full_auto_box)
+        friend_game_claim_row.pack(fill=X)
+        ttk.Button(
+            friend_game_claim_row,
+            text="当前账号自动游戏领取",
+            command=self.friend_game_claim_current,
+        ).pack(side=LEFT, padx=4, pady=4)
+        ttk.Button(
+            friend_game_claim_row,
+            text="开始全自动游戏领取",
+            command=self.start_full_auto_friend_game_claim,
+        ).pack(side=LEFT, padx=4, pady=4)
+        ttk.Button(friend_game_claim_row, text="暂停", command=self.pause_full_auto).pack(side=LEFT, padx=4, pady=4)
+        ttk.Button(
+            friend_game_claim_row,
+            text="继续游戏领取",
+            command=self.resume_full_auto_friend_game_claim,
+        ).pack(side=LEFT, padx=4, pady=4)
+        ttk.Button(
+            friend_game_claim_row,
+            text="停止并保留现场",
+            command=self.stop_full_auto,
+        ).pack(side=LEFT, padx=4, pady=4)
+        ttk.Label(
+            friend_game_claim_row,
+            text="流程：登录 -> 通知礼物 -> 领取 -> 资产确认截图 -> 登出 -> 下一个账号。",
+        ).pack(side=LEFT, padx=12, pady=2)
+
         self.manual_box = ttk.LabelFrame(right, text="应急手动复制（仅在半自动失败时使用）", padding=8)
         self.manual_box.pack(fill=X, pady=8)
         ttk.Button(self.manual_box, text="复制账号", command=self.copy_account).pack(side=LEFT, padx=4, pady=4)
@@ -2692,6 +4179,23 @@ class SteamTaskAssistant:
         self.refresh_tasks()
         self.status_var.set(f"已导入/刷新 {count} 个索尼克赛车交叉世界账号检测任务")
 
+    def import_friend_claim_tasks(self) -> None:
+        if self.auto_running:
+            messagebox.showwarning("批次运行中", "请先停止当前批次，再刷新58家好友链接任务。")
+            return
+        try:
+            count = self.store.import_friend_claim_tasks(APP_DIR.parent, replace=True)
+        except Exception as exc:
+            messagebox.showerror("导入好友链接任务失败", str(exc))
+            return
+        self.filter_mode_var.set("好友码提货")
+        self.friend_claim_limit_var.set(count)
+        self.current_task_id = None
+        self.update_mode_controls()
+        self.refresh_tasks()
+        self.friend_claim_progress_var.set(f"好友码提货：已导入{count}家待采集账号")
+        self.status_var.set(f"已导入/刷新 {count} 家红色沙漠部署账号的好友链接采集任务")
+
     def current_playtime_task(self) -> Task | None:
         task = self.current_task()
         if task is None:
@@ -2763,6 +4267,92 @@ class SteamTaskAssistant:
             return
         self.start_full_auto_playtime(use_login=True)
 
+    def start_full_auto_friend_claim(self) -> None:
+        if not self.ensure_not_stopped() or self.auto_running:
+            return
+        if self.filter_mode_var.get() != "好友码提货":
+            messagebox.showwarning("模式不正确", "全自动采集只会在“好友码提货”模式中运行。")
+            return
+        limit = max(0, int(self.friend_claim_limit_var.get() or 0))
+        tasks = self.store.pending_friend_claim_tasks(self.current_task_id, limit)
+        if not tasks:
+            messagebox.showinfo("没有任务", "当前没有待采集两条好友链接的账号。")
+            return
+        if self.friend_claim_use_system_proxy_var.get():
+            os.environ["STEAM_ASSISTANT_USE_SYSTEM_PROXY"] = "1"
+        else:
+            os.environ.pop("STEAM_ASSISTANT_USE_SYSTEM_PROXY", None)
+        self.auto_pause_event.clear()
+        self.auto_stop_event.clear()
+        self.auto_running = True
+        self.browser_worker.submit("full_auto_friend_claim_collection", tasks)
+
+    def resume_full_auto_friend_claim(self) -> None:
+        if self.emergency_stopped:
+            return
+        if self.auto_running:
+            self.auto_pause_event.clear()
+            self.friend_claim_progress_var.set("好友码提货：批量继续运行")
+            self.log("好友码提货", "已继续批量采集")
+            return
+        if self.filter_mode_var.get() != "好友码提货":
+            messagebox.showwarning("模式不正确", "继续采集只适用于“好友码提货”模式。")
+            return
+        self.start_full_auto_friend_claim()
+
+    def friend_game_claim_current(self) -> None:
+        task = self.current_friend_claim_task()
+        if task is None:
+            return
+        if resolve_game_product(task.game_name) is None:
+            messagebox.showerror("游戏未配置", f"无法识别游戏：{task.game_name}")
+            return
+        self.store.update_friend_claim_state(task.id, "处理中", "正在自动游戏领取")
+        self.friend_claim_progress_var.set("好友码提货：正在自动游戏领取")
+        self.refresh_tasks()
+        self.browser_worker.submit("claim_friend_game_gift", task)
+
+    def start_full_auto_friend_game_claim(self) -> None:
+        if not self.ensure_not_stopped() or self.auto_running:
+            return
+        if self.filter_mode_var.get() != "好友码提货":
+            messagebox.showwarning("模式不正确", "自动游戏领取只会在“好友码提货”模式中运行。")
+            return
+        limit = max(0, int(self.friend_claim_limit_var.get() or 0))
+        tasks = self.store.pending_friend_game_claim_tasks(self.current_task_id, limit)
+        if not tasks:
+            messagebox.showinfo("没有任务", "当前没有待执行自动游戏领取的账号。")
+            return
+        if not messagebox.askyesno(
+            "开始自动游戏领取",
+            f"将从当前账号开始连续处理 {len(tasks)} 个账号。\n\n"
+            "程序会自动登录账号、点击通知中的礼物、执行领取、打开资产清单确认目标游戏并截图，然后登出进入下一个账号。\n\n"
+            "如果没有找到礼物通知且资产清单也没有目标游戏，程序会停在当前账号并标记人工处理。\n\n是否开始？",
+            default=messagebox.NO,
+        ):
+            return
+        if self.friend_claim_use_system_proxy_var.get():
+            os.environ["STEAM_ASSISTANT_USE_SYSTEM_PROXY"] = "1"
+        else:
+            os.environ.pop("STEAM_ASSISTANT_USE_SYSTEM_PROXY", None)
+        self.auto_pause_event.clear()
+        self.auto_stop_event.clear()
+        self.auto_running = True
+        self.browser_worker.submit("full_auto_friend_game_claim", tasks)
+
+    def resume_full_auto_friend_game_claim(self) -> None:
+        if self.emergency_stopped:
+            return
+        if self.auto_running:
+            self.auto_pause_event.clear()
+            self.friend_claim_progress_var.set("好友码提货：自动游戏领取继续运行")
+            self.log("自动游戏领取", "已继续运行")
+            return
+        if self.filter_mode_var.get() != "好友码提货":
+            messagebox.showwarning("模式不正确", "继续游戏领取只适用于“好友码提货”模式。")
+            return
+        self.start_full_auto_friend_game_claim()
+
     def refresh_tasks(self) -> None:
         for item in self.task_tree.get_children():
             self.task_tree.delete(item)
@@ -2771,6 +4361,8 @@ class SteamTaskAssistant:
             game_display = task.last_played_game if task.mode == "游玩时间检测" and task.last_played_game else task.game_name
             if task.mode == "游玩时间检测" and task.last_played_days:
                 game_display = f"{game_display}（{task.last_played_days}）" if game_display else task.last_played_days
+            if task.mode == "好友码提货":
+                game_display = task.pickup_status or "待采集"
             self.task_tree.insert(
                 "",
                 END,
@@ -2798,6 +4390,8 @@ class SteamTaskAssistant:
         self.activation_box.pack_forget()
         self.purchase_box.pack_forget()
         self.playtime_box.pack_forget()
+        self.friend_claim_box.pack_forget()
+        self.friend_claim_full_auto_box.pack_forget()
         self.code_box.pack_forget()
 
         if mode == "兑换码兑换":
@@ -2812,6 +4406,10 @@ class SteamTaskAssistant:
             self.purchase_box.pack(fill=X, pady=8, before=self.manual_box)
         elif mode == "游玩时间检测":
             self.playtime_box.pack(fill=X, pady=8, before=self.manual_box)
+        elif mode == "好友码提货":
+            self.friend_claim_full_auto_box.pack(fill=X, pady=8, before=self.manual_box)
+            self.friend_claim_box.pack(fill=X, pady=8, before=self.manual_box)
+            self.code_box.pack(fill=BOTH, expand=True, pady=8, before=self.log_box)
         else:
             self.status_var.set("请选择具体工作模式后再执行自动化操作")
 
@@ -2869,6 +4467,15 @@ class SteamTaskAssistant:
                 f"距离今天：{task.last_played_days or '未检测'}\n"
                 f"检测来源：{task.last_played_source or '未检测'}\n"
             )
+        friend_claim_line = ""
+        if task.mode == "好友码提货":
+            friend_claim_line = (
+                f"提货码：{task.pickup_code or '未录入'}\n"
+                f"提货网址：{task.pickup_url or '未录入'}\n"
+                f"好友链接1：{'已采集' if task.friend_link_1 else '未采集'}\n"
+                f"好友链接2：{'已采集' if task.friend_link_2 else '未采集'}\n"
+                f"提货状态：{task.pickup_status or '待处理'}\n"
+            )
         return (
             f"店编：{task.store_code}\n"
             f"店名：{task.store_name}\n"
@@ -2879,6 +4486,7 @@ class SteamTaskAssistant:
             f"购买游戏：{task.game_name} {task.game_price}\n"
             f"{product_line}"
             f"{playtime_line}"
+            f"{friend_claim_line}"
             f"兑换码数量：{len(task.voucher_codes)}    激活码数量：{len(task.activation_codes)}\n"
             f"状态：{task.status}\n"
             f"备注：{task.note}"
@@ -2896,11 +4504,21 @@ class SteamTaskAssistant:
             rows = [("激活码", code) for code in task.activation_codes]
         elif task.mode == "游玩时间检测":
             rows = [("账号链接", task.profile_link or "未匹配账号链接")]
+        elif task.mode == "好友码提货":
+            rows = [
+                ("提货码", task.pickup_code or "未录入"),
+                ("好友链接1", task.friend_link_1 or "未采集"),
+                ("好友链接2", task.friend_link_2 or "未采集"),
+                ("提货网址", task.pickup_url or "未录入"),
+            ]
         else:
             rows = [("购买游戏", task.game_name)] if task.game_name else []
         for idx, (kind, code) in enumerate(rows, start=1):
             result = results.get(idx - 1)
-            result_status = result["status"] if result else "待处理"
+            if task.mode == "好友码提货":
+                result_status = task.pickup_status or "待处理"
+            else:
+                result_status = result["status"] if result else "待处理"
             self.code_tree.insert("", END, iid=str(idx - 1), values=(idx, kind, code, result_status))
         if rows:
             self.code_tree.selection_set("0")
@@ -2920,6 +4538,13 @@ class SteamTaskAssistant:
             return task.voucher_codes
         if task.mode == "激活码激活":
             return task.activation_codes
+        if task.mode == "好友码提货":
+            return [
+                task.pickup_code,
+                task.friend_link_1,
+                task.friend_link_2,
+                task.pickup_url,
+            ]
         return [task.game_name] if task.game_name else []
 
     def on_code_selected(self, _event: object) -> None:
@@ -3021,6 +4646,9 @@ class SteamTaskAssistant:
             elif self.filter_mode_var.get() == "游玩时间检测":
                 self.playtime_progress_var.set("游玩检测：批量已暂停")
                 self.log("游玩检测", "已请求暂停，将在当前安全步骤停下")
+            elif self.filter_mode_var.get() == "好友码提货":
+                self.friend_claim_progress_var.set("好友码提货：批量已暂停")
+                self.log("好友码提货", "已请求暂停，将在当前账号安全步骤停下")
             else:
                 self.auto_progress_var.set("全自动：已暂停")
                 self.log("全自动", "已请求暂停，将在当前安全步骤停下")
@@ -3060,6 +4688,9 @@ class SteamTaskAssistant:
             elif self.filter_mode_var.get() == "游玩时间检测":
                 self.playtime_progress_var.set("游玩检测：批量正在停止")
                 self.log("游玩检测", "已请求停止，浏览器现场将保留")
+            elif self.filter_mode_var.get() == "好友码提货":
+                self.friend_claim_progress_var.set("好友码提货：批量正在停止")
+                self.log("好友码提货", "已请求停止，浏览器现场将保留")
             else:
                 self.auto_progress_var.set("全自动：正在停止")
                 self.log("全自动", "已请求停止，浏览器现场将保留")
@@ -3086,8 +4717,85 @@ class SteamTaskAssistant:
         codes = self.current_codes()
         if not codes:
             return
+        if not codes[self.current_code_index]:
+            messagebox.showwarning("没有可复制内容", "当前项目尚未录入或采集。")
+            return
         copy_to_clipboard(self.root, codes[self.current_code_index])
         self.log("应急复制", f"已复制当前码：第 {self.current_code_index + 1} 个")
+
+    def copy_friend_link(self, number: int) -> None:
+        task = self.current_task()
+        if task is None or task.mode != "好友码提货":
+            messagebox.showwarning("模式不正确", "请先切换到“好友码提货”模式。")
+            return
+        link = task.friend_link_1 if number == 1 else task.friend_link_2
+        if not link:
+            messagebox.showwarning("尚未采集", f"好友链接{number}尚未采集。")
+            return
+        copy_to_clipboard(self.root, link)
+        self.log("好友码提货", f"已复制好友链接{number}")
+
+    def copy_pickup_code(self) -> None:
+        task = self.current_task()
+        if task is None or task.mode != "好友码提货":
+            messagebox.showwarning("模式不正确", "请先切换到“好友码提货”模式。")
+            return
+        if not task.pickup_code:
+            messagebox.showwarning("未录入提货码", "请在标准任务表的“提货码”列填写后重新导入。")
+            return
+        copy_to_clipboard(self.root, task.pickup_code)
+        self.log("好友码提货", "已复制提货码")
+
+    def current_friend_claim_task(
+        self,
+        require_pickup_code: bool = False,
+        require_pickup_url: bool = False,
+    ) -> Task | None:
+        if not self.ensure_not_stopped():
+            return None
+        task = self.current_task()
+        if task is None:
+            return None
+        if task.mode != "好友码提货":
+            messagebox.showwarning("模式不正确", "当前任务不是好友码提货任务。")
+            return None
+        if require_pickup_code and not task.pickup_code:
+            messagebox.showwarning("缺少提货码", "请在标准任务表的“提货码”列填写后重新导入。")
+            return None
+        if require_pickup_url and not task.pickup_url:
+            messagebox.showwarning("缺少提货网址", "请在标准任务表的“提货网址”列填写后重新导入。")
+            return None
+        return task
+
+    def friend_claim_login_collect(self) -> None:
+        task = self.current_friend_claim_task()
+        if task is None:
+            return
+        self.store.update_friend_claim_state(task.id, "处理中", "正在登录并采集好友链接")
+        self.friend_claim_progress_var.set("好友码提货：正在登录并采集好友链接")
+        self.refresh_tasks()
+        self.browser_worker.submit("start_friend_claim_account", task)
+
+    def friend_claim_open_page(self) -> None:
+        task = self.current_friend_claim_task(require_pickup_code=True, require_pickup_url=True)
+        if task is None:
+            return
+        self.store.update_friend_claim_state(task.id, "处理中", "正在打开提货页")
+        self.friend_claim_progress_var.set("好友码提货：正在打开提货页")
+        self.refresh_tasks()
+        self.browser_worker.submit("open_friend_claim_page", task)
+
+    def friend_claim_capture_result(self) -> None:
+        task = self.current_friend_claim_task()
+        if task is None:
+            return
+        self.browser_worker.submit("capture_friend_claim_result", task)
+
+    def friend_claim_finish_logout(self) -> None:
+        task = self.current_friend_claim_task()
+        if task is None:
+            return
+        self.browser_worker.submit("finish_friend_claim_and_logout", task)
 
     def current_purchase_task(self) -> Task | None:
         if not self.ensure_not_stopped():
@@ -3288,6 +4996,8 @@ class SteamTaskAssistant:
             self.browser_worker.submit("start_purchase_account", task)
         elif task.mode == "游玩时间检测":
             self.browser_worker.submit("detect_playtime_login", task)
+        elif task.mode == "好友码提货":
+            self.browser_worker.submit("start_friend_claim_account", task)
         self.log("任务", "已启动当前账号半自动流程")
 
     def fill_current_code(self) -> None:
@@ -3300,7 +5010,7 @@ class SteamTaskAssistant:
         code = codes[self.current_code_index]
         if task.mode == "激活码激活":
             self.browser_worker.submit("fill_activation_code", code)
-        else:
+        elif task.mode == "兑换码兑换":
             self.browser_worker.submit("fill_redeem_code", code)
 
     def confirm_redeem_code(self) -> None:
@@ -3399,6 +5109,8 @@ class SteamTaskAssistant:
                     self.activation_progress_var.set("激活流程：自动化异常，已停止")
                 elif self.filter_mode_var.get() == "游玩时间检测":
                     self.playtime_progress_var.set("游玩检测：自动化异常，已停止")
+                elif self.filter_mode_var.get() == "好友码提货":
+                    self.friend_claim_progress_var.set("好友码提货：自动化异常，已停止")
                 else:
                     self.auto_progress_var.set("全自动：自动化异常，已停止")
             messagebox.showerror("自动化错误", message)
@@ -3618,6 +5330,268 @@ class SteamTaskAssistant:
             self.auto_stop_event.clear()
             text = "游玩检测：批量已停止" if stopped else "游玩检测：批量完成"
             self.playtime_progress_var.set(text)
+            self.status_var.set(text)
+            self.refresh_tasks()
+
+        self.root.after(0, update)
+
+    def ui_friend_claim_batch_started(self, task_count: int) -> None:
+        def update() -> None:
+            self.auto_running = True
+            self.friend_claim_progress_var.set(f"好友码提货：准备处理 {task_count} 家账号")
+            self.status_var.set("58家好友链接全自动采集已启动")
+
+        self.root.after(0, update)
+
+    def ui_friend_claim_batch_task_started(
+        self,
+        task: Task,
+        task_number: int,
+        task_count: int,
+    ) -> None:
+        def update() -> None:
+            self.set_current(task.id)
+            self.store.update_friend_claim_state(
+                task.id,
+                "处理中",
+                f"正在采集好友链接（{task_number}/{task_count}）",
+            )
+            self.store.add_event(
+                task.id,
+                "好友码提货批量",
+                f"开始账号 {task_number}/{task_count}",
+            )
+            self.friend_claim_progress_var.set(
+                f"好友码提货：{task_number}/{task_count}，{task.store_code}"
+            )
+            self.status_var.set(f"正在采集 {task.store_code} 的两条好友链接")
+            self.refresh_tasks()
+
+        self.root.after(0, update)
+
+    def ui_friend_claim_collection_finished(self, task_id: int) -> None:
+        def update() -> None:
+            self.store.update_friend_claim_state(task_id, "成功", "好友链接已采集并已登出")
+            self.store.add_event(task_id, "好友码提货批量", "两条好友链接已采集并确认登出")
+            self.friend_claim_progress_var.set("好友码提货：当前账号采集完成并已登出")
+            self.status_var.set("当前账号的两条好友链接已采集并已登出")
+            self.refresh_tasks()
+            if self.current_task_id == task_id:
+                self.fill_codes(self.current_task())
+                self.fill_logs(task_id)
+
+        self.root.after(0, update)
+
+    def ui_friend_claim_batch_finished(self, stopped: bool) -> None:
+        def update() -> None:
+            self.auto_running = False
+            self.auto_pause_event.clear()
+            self.auto_stop_event.clear()
+            text = "好友码提货：批量已停止" if stopped else "好友码提货：批量采集完成"
+            self.friend_claim_progress_var.set(text)
+            self.status_var.set(text)
+            self.refresh_tasks()
+
+        self.root.after(0, update)
+
+    def ui_friend_claim_links_collected(
+        self,
+        task_id: int,
+        friend_link_1: str,
+        friend_link_2: str,
+    ) -> None:
+        def update() -> None:
+            self.store.update_friend_claim_links(task_id, friend_link_1, friend_link_2)
+            self.store.update_friend_claim_state(task_id, "处理中", "好友链接已采集")
+            self.store.add_event(task_id, "好友码提货", "已采集两条不同的Steam好友邀请链接")
+            self.friend_claim_progress_var.set("好友码提货：好友链接已采集")
+            self.status_var.set("已采集两条好友邀请链接，可打开提货页")
+            self.refresh_tasks()
+            if self.current_task_id == task_id:
+                self.fill_codes(self.current_task())
+                self.fill_logs(task_id)
+
+        self.root.after(0, update)
+
+    def ui_friend_claim_link_saved(
+        self,
+        task_id: int,
+        link_number: int,
+        friend_link: str,
+    ) -> None:
+        def update() -> None:
+            self.store.update_friend_claim_link(task_id, link_number, friend_link)
+            self.store.add_event(
+                task_id,
+                "好友码提货",
+                f"已写入好友链接{link_number}",
+            )
+            self.friend_claim_progress_var.set(f"好友码提货：已写入好友链接{link_number}")
+            self.status_var.set(f"好友链接{link_number}已写入任务表")
+            self.refresh_tasks()
+            if self.current_task_id == task_id:
+                self.fill_codes(self.current_task())
+                self.fill_logs(task_id)
+
+        self.root.after(0, update)
+
+    def ui_friend_claim_ready(self, task_id: int, message: str) -> None:
+        def update() -> None:
+            self.store.update_friend_claim_state(task_id, "处理中", "提货页已打开")
+            self.store.add_event(task_id, "好友码提货", message)
+            self.friend_claim_progress_var.set("好友码提货：提货页已打开")
+            self.status_var.set(message)
+            self.refresh_tasks()
+            if self.current_task_id == task_id:
+                self.fill_codes(self.current_task())
+                self.fill_logs(task_id)
+
+        self.root.after(0, update)
+
+    def ui_friend_claim_result_captured(self, task_id: int, path: Path) -> None:
+        def update() -> None:
+            self.store.update_friend_claim_state(task_id, "处理中", "提货结果已截图", str(path))
+            self.store.add_event(task_id, "好友码提货", "已保存提货结果截图", str(path))
+            self.friend_claim_progress_var.set("好友码提货：提货结果已截图")
+            self.status_var.set(f"已保存提货结果截图：{path}")
+            self.refresh_tasks()
+            if self.current_task_id == task_id:
+                self.fill_codes(self.current_task())
+                self.fill_logs(task_id)
+
+        self.root.after(0, update)
+
+    def ui_friend_claim_issue(self, task_id: int, message: str) -> None:
+        def update() -> None:
+            self.store.update_friend_claim_state(task_id, "需要人工处理", "需要人工处理")
+            self.store.add_event(task_id, "好友码提货暂停", message)
+            self.friend_claim_progress_var.set(f"好友码提货：已暂停，{message}")
+            self.status_var.set(message)
+            self.refresh_tasks()
+            if self.current_task_id == task_id:
+                self.fill_codes(self.current_task())
+                self.fill_logs(task_id)
+
+        self.root.after(0, update)
+
+    def ui_friend_claim_finished(self, task_id: int) -> None:
+        def update() -> None:
+            self.store.update_friend_claim_state(task_id, "成功", "提货完成并已登出")
+            self.store.add_event(task_id, "好友码提货", "提货完成并确认登出")
+            self.friend_claim_progress_var.set("好友码提货：完成并已登出")
+            self.status_var.set("好友码提货完成并已登出")
+            if self.current_task_id == task_id:
+                next_task = self.store.next_task_after(task_id, "好友码提货")
+                self.set_current(next_task.id if next_task else None)
+            self.refresh_tasks()
+
+        self.root.after(0, update)
+
+    def ui_friend_game_claim_batch_started(self, task_count: int) -> None:
+        def update() -> None:
+            self.auto_running = True
+            self.friend_claim_progress_var.set(f"好友码提货：自动游戏领取准备处理 {task_count} 家账号")
+            self.status_var.set("自动游戏领取已启动")
+
+        self.root.after(0, update)
+
+    def ui_friend_game_claim_batch_task_started(
+        self,
+        task: Task,
+        task_number: int,
+        task_count: int,
+    ) -> None:
+        def update() -> None:
+            self.set_current(task.id)
+            self.store.update_friend_claim_state(
+                task.id,
+                "处理中",
+                f"正在自动游戏领取（{task_number}/{task_count}）",
+            )
+            self.store.add_event(
+                task.id,
+                "自动游戏领取",
+                f"开始账号 {task_number}/{task_count}",
+            )
+            self.friend_claim_progress_var.set(
+                f"好友码提货：自动游戏领取 {task_number}/{task_count}，{task.store_code}"
+            )
+            self.status_var.set(f"正在领取 {task.store_code} 的礼物游戏")
+            self.refresh_tasks()
+
+        self.root.after(0, update)
+
+    def ui_friend_game_claim_step(
+        self,
+        task_id: int,
+        step: str,
+        message: str,
+        screenshot_path: Path | None = None,
+    ) -> None:
+        def update() -> None:
+            self.store.add_event(
+                task_id,
+                "自动游戏领取",
+                f"{step}：{message}",
+                str(screenshot_path or ""),
+            )
+            self.friend_claim_progress_var.set(f"好友码提货：自动游戏领取-{step}")
+            self.status_var.set(message)
+            if self.current_task_id == task_id:
+                self.fill_logs(task_id)
+
+        self.root.after(0, update)
+
+    def ui_friend_game_claim_finished(
+        self,
+        task_id: int,
+        message: str,
+        screenshot_path: Path | None = None,
+    ) -> None:
+        def update() -> None:
+            self.store.update_friend_claim_state(
+                task_id,
+                "成功",
+                "自动游戏领取完成",
+                str(screenshot_path or ""),
+            )
+            self.store.add_event(
+                task_id,
+                "自动游戏领取",
+                message,
+                str(screenshot_path or ""),
+            )
+            self.friend_claim_progress_var.set("好友码提货：自动游戏领取完成")
+            self.status_var.set(message)
+            if self.current_task_id == task_id:
+                next_task = self.store.next_task_after(task_id, "好友码提货")
+                self.set_current(next_task.id if next_task else None)
+            self.refresh_tasks()
+
+        self.root.after(0, update)
+
+    def ui_friend_game_claim_issue(self, task_id: int, message: str) -> None:
+        self.auto_pause_event.set()
+
+        def update() -> None:
+            self.store.update_friend_claim_state(task_id, "需要人工处理", f"自动游戏领取暂停：{message}")
+            self.store.add_event(task_id, "自动游戏领取暂停", message)
+            self.friend_claim_progress_var.set(f"好友码提货：自动游戏领取暂停，{message}")
+            self.status_var.set(message)
+            self.refresh_tasks()
+            if self.current_task_id == task_id:
+                self.fill_codes(self.current_task())
+                self.fill_logs(task_id)
+
+        self.root.after(0, update)
+
+    def ui_friend_game_claim_batch_finished(self, stopped: bool) -> None:
+        def update() -> None:
+            self.auto_running = False
+            self.auto_pause_event.clear()
+            self.auto_stop_event.clear()
+            text = "好友码提货：自动游戏领取已停止" if stopped else "好友码提货：自动游戏领取完成"
+            self.friend_claim_progress_var.set(text)
             self.status_var.set(text)
             self.refresh_tasks()
 
@@ -3870,6 +5844,449 @@ class SteamTaskAssistant:
             self.store.add_event(task.id, event_type, message)
             self.fill_logs(task.id)
         self.status_var.set(message)
+
+
+ASSASSINS_CREED_PRODUCT = {
+    "official_name": "刺客信条：黑旗 记忆重置",
+    "license_names": [
+        "刺客信条",
+        "刺客信条：黑旗",
+        "刺客信条：黑旗 记忆重置",
+        "Assassin's Creed",
+        "Assassin's Creed Black Flag",
+        "Assassin's Creed Black Flag Resynced",
+    ],
+}
+
+GAME_CATALOG.update(
+    {
+        "刺客信条": ASSASSINS_CREED_PRODUCT,
+        "刺客信条黑旗": ASSASSINS_CREED_PRODUCT,
+        "刺客信条：黑旗 记忆重置": ASSASSINS_CREED_PRODUCT,
+        "Assassin's Creed Black Flag Resynced": ASSASSINS_CREED_PRODUCT,
+    }
+)
+
+
+def _fast_open_gift_notification_page(self: SteamBrowserController, task: Task, product: dict) -> bool:
+    candidate_urls: list[str] = []
+    profile_link = (task.profile_link or "").strip().rstrip("/")
+    if profile_link:
+        candidate_urls.append(f"{profile_link}/inventory/#pending_gifts")
+    candidate_urls.append(STEAM_PENDING_GIFTS_URL)
+
+    seen: set[str] = set()
+    for url in candidate_urls:
+        if self._stopped():
+            return False
+        if url in seen:
+            continue
+        seen.add(url)
+        if not self._goto_friend_claim_page(url, "待收礼物页面"):
+            continue
+        try:
+            self.page.wait_for_load_state("domcontentloaded", timeout=6000)
+        except Exception:
+            pass
+        time.sleep(0.8)
+        _raise_if_steam_e502(self, "待收礼物页面")
+        self._log(f"已直达待收礼物页面：{url}")
+        return True
+    return False
+
+
+def _fast_click_positive_gift_claim_control(self: SteamBrowserController) -> str:
+    self._ensure_page()
+    try:
+        target = self.page.evaluate(
+            """
+            () => {
+                const addPattern = /添加.{0,10}(我的)?库|添加至我的库|添加到我的库|Add to.{0,12}Library/i;
+                const acceptPattern = /接受礼物|接收礼物|领取礼物|收下礼物|Accept Gift|Redeem Gift/i;
+                const negative = /拒绝|拒收|取消|退回|删除|Decline|Reject|Cancel|Return|Remove|Delete/i;
+                const visible = (element) => {
+                    const style = window.getComputedStyle(element);
+                    const rect = element.getBoundingClientRect();
+                    return style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && rect.width > 3
+                        && rect.height > 3
+                        && !element.disabled;
+                };
+                const textOf = (element) => [
+                    element.innerText,
+                    element.textContent,
+                    element.value,
+                    element.id,
+                    element.className,
+                    element.getAttribute('onclick'),
+                    element.getAttribute('title'),
+                    element.getAttribute('aria-label'),
+                    element.getAttribute('data-tooltip-text'),
+                ].filter(Boolean).join(' ');
+                const nodes = Array.from(document.querySelectorAll(
+                    'button, a, input, [role="button"], .btn_green_steamui, .btnv6_green_white_innerfade, .btn_green_white_innerfade, span, div'
+                ));
+                const candidates = [];
+                for (const node of nodes) {
+                    const element = node.closest('button, a, input, [role="button"], .btn_green_steamui, .btnv6_green_white_innerfade, .btn_green_white_innerfade') || node;
+                    if (candidates.some((item) => item.element === element) || !visible(element)) continue;
+                    const text = textOf(element);
+                    if (!text || negative.test(text)) continue;
+                    const action = addPattern.test(text) ? '添加至我的库' : (acceptPattern.test(text) ? '接受礼物' : '');
+                    if (!action) continue;
+                    candidates.push({ element, text, action });
+                }
+                candidates.sort((a, b) => {
+                    const ap = a.action === '添加至我的库' ? 0 : 1;
+                    const bp = b.action === '添加至我的库' ? 0 : 1;
+                    return ap - bp;
+                });
+                const target = candidates[0];
+                if (!target) return null;
+                target.element.scrollIntoView({ block: 'center', inline: 'center' });
+                const rect = target.element.getBoundingClientRect();
+                return {
+                    action: target.action,
+                    text: target.text.slice(0, 80),
+                    x: rect.left + rect.width / 2,
+                    y: rect.top + rect.height / 2,
+                };
+            }
+            """
+        )
+        if not target:
+            return ""
+        self.page.mouse.move(float(target["x"]), float(target["y"]))
+        time.sleep(0.18)
+        self.page.mouse.down()
+        time.sleep(0.12)
+        self.page.mouse.up()
+        action = str(target.get("action") or "礼物领取确认")
+        self._log(f"已点击礼物控件：{action}")
+        return action
+    except Exception as exc:
+        self._log(f"快速点击礼物控件失败：{exc}")
+        return ""
+
+
+def _fast_page_text(self: SteamBrowserController) -> str:
+    try:
+        return str(self.page.evaluate("() => document.body ? document.body.innerText : ''") or "")
+    except Exception:
+        return ""
+
+
+class SteamE502Error(RuntimeError):
+    pass
+
+
+def _text_has_steam_e502(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return (
+        "e502" in lowered
+        or ("something went wrong" in lowered and "unable to service your request" in lowered)
+        or "we were unable to service your request" in lowered
+    )
+
+
+def _steam_e502_visible(self: SteamBrowserController) -> bool:
+    return _text_has_steam_e502(_fast_page_text(self))
+
+
+def _wait_for_steam_e502_recovery(
+    self: SteamBrowserController,
+    context: str,
+    delays: tuple[int, ...] = (20, 45, 90, 180),
+) -> bool:
+    if not _steam_e502_visible(self):
+        return True
+    for attempt, delay in enumerate(delays, start=1):
+        if self._stopped():
+            return False
+        self._log(f"{context} 出现 Steam E502 L2，冷却 {delay} 秒后重试（{attempt}/{len(delays)}）")
+        time.sleep(delay)
+        try:
+            self.page.reload(wait_until="domcontentloaded", timeout=45000)
+        except Exception as exc:
+            self._log(f"{context} E502 重载失败，继续检测：{exc}")
+        try:
+            self.page.wait_for_load_state("domcontentloaded", timeout=8000)
+        except Exception:
+            pass
+        time.sleep(1.5)
+        if not _steam_e502_visible(self):
+            self._log(f"{context} E502 已恢复")
+            return True
+    return False
+
+
+def _raise_if_steam_e502(self: SteamBrowserController, context: str) -> None:
+    if _steam_e502_visible(self) and not _wait_for_steam_e502_recovery(self, context):
+        raise SteamE502Error(f"{context} 持续返回 Steam E502 L2")
+
+
+def _gift_claim_page_state(self: SteamBrowserController) -> dict:
+    try:
+        return dict(
+            self.page.evaluate(
+                """
+                () => {
+                    const addPattern = /添加.{0,10}(我的)?库|添加至我的库|添加到我的库|Add to.{0,12}Library/i;
+                    const acceptPattern = /接受礼物|接收礼物|领取礼物|收下礼物|Accept Gift|Redeem Gift/i;
+                    const successPattern = /已添加到您的库|已加入您的库|已经在您的库|添加到了您的 Steam 库|added to your library|already in your library|successfully redeemed|gift has been accepted/i;
+                    const negative = /拒绝|拒收|取消|退回|删除|Decline|Reject|Cancel|Return|Remove|Delete/i;
+                    const visible = (element) => {
+                        const style = window.getComputedStyle(element);
+                        const rect = element.getBoundingClientRect();
+                        return style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && rect.width > 3
+                            && rect.height > 3
+                            && !element.disabled;
+                    };
+                    const textOf = (element) => [
+                        element.innerText,
+                        element.textContent,
+                        element.value,
+                        element.id,
+                        element.className,
+                        element.getAttribute('onclick'),
+                        element.getAttribute('title'),
+                        element.getAttribute('aria-label'),
+                    ].filter(Boolean).join(' ');
+                    const bodyText = document.body ? document.body.innerText || '' : '';
+                    let addVisible = false;
+                    let acceptVisible = false;
+                    for (const node of Array.from(document.querySelectorAll('button, a, input, [role="button"], .btn_green_steamui, .btnv6_green_white_innerfade, .btn_green_white_innerfade, span, div'))) {
+                        const element = node.closest('button, a, input, [role="button"], .btn_green_steamui, .btnv6_green_white_innerfade, .btn_green_white_innerfade') || node;
+                        if (!visible(element)) continue;
+                        const text = textOf(element);
+                        if (!text || negative.test(text)) continue;
+                        addVisible = addVisible || addPattern.test(text);
+                        acceptVisible = acceptVisible || acceptPattern.test(text);
+                    }
+                    return {
+                        addVisible,
+                        acceptVisible,
+                        successVisible: successPattern.test(bodyText),
+                    };
+                }
+                """
+            )
+            or {}
+        )
+    except Exception:
+        return {}
+
+
+def _fast_claim_gift_on_current_page(self: SteamBrowserController, task: Task, product: dict) -> bool:
+    clicked_any = False
+    success_markers = [
+        "已添加到您的库",
+        "已加入您的库",
+        "已经在您的库",
+        "添加到了您的 Steam 库",
+        "added to your library",
+        "already in your library",
+        "successfully redeemed",
+        "gift has been accepted",
+    ]
+    deadline = time.time() + 38
+
+    while time.time() < deadline:
+        if self._stopped():
+            return False
+        _raise_if_steam_e502(self, "礼物领取页面")
+        state = _gift_claim_page_state(self)
+        if state.get("successVisible"):
+            self._log("页面显示礼物已领取")
+            return True
+        self._select_add_to_library_option()
+        action = self._click_positive_gift_claim_control()
+        if action:
+            clicked_any = True
+            if "库" in action or "library" in action.lower():
+                add_deadline = time.time() + 9
+                retried_add_click = False
+                while time.time() < add_deadline:
+                    if self._stopped():
+                        return False
+                    time.sleep(0.8)
+                    state = _gift_claim_page_state(self)
+                    if state.get("successVisible"):
+                        self._log("页面显示礼物已加入库")
+                        return True
+                    if not state.get("addVisible"):
+                        time.sleep(2.5)
+                        self._log("添加至我的库按钮已消失，转入最终资产校验")
+                        return True
+                    if not retried_add_click:
+                        retried_add_click = True
+                        self._log("添加至我的库按钮仍可见，补点一次")
+                        self._click_positive_gift_claim_control()
+                self._log("添加至我的库后等待完成，转入最终资产校验")
+                return True
+
+            accept_deadline = time.time() + 8
+            while time.time() < accept_deadline:
+                if self._stopped():
+                    return False
+                time.sleep(0.6)
+                state = _gift_claim_page_state(self)
+                if state.get("successVisible") or state.get("addVisible"):
+                    break
+            continue
+
+        body_text = _fast_page_text(self)
+        lowered = body_text.lower()
+        if any(marker.lower() in lowered for marker in success_markers):
+            self._log("页面显示礼物已领取")
+            return True
+        time.sleep(0.55 if clicked_any else 0.8)
+
+    if clicked_any:
+        self._log("已点击过领取控件，转入最终资产校验")
+    else:
+        self._log("待收礼物页未找到可点击的领取控件")
+    return clicked_any
+
+
+def _fast_verify_friend_game_asset(self: SteamBrowserController, task: Task, status_text: str) -> Path | None:
+    product = self._friend_claim_product(task)
+    if product is None:
+        return None
+    opened = False
+    for attempt in range(3):
+        try:
+            self._goto(STEAM_LICENSES_URL)
+            opened = True
+            break
+        except Exception as exc:
+            message = str(exc)
+            if "ERR_HTTP_RESPONSE_CODE_FAILURE" in message or "502" in message:
+                delay = (20, 45, 90)[attempt]
+                self._log(f"资产清单页面疑似 Steam E502，冷却 {delay} 秒后重试 {attempt + 1}/3：{exc}")
+                time.sleep(delay)
+                continue
+            self._log(f"资产清单页面打开失败，准备重试 {attempt + 1}/3：{exc}")
+            time.sleep(2.5)
+    if not opened:
+        raise SteamE502Error("资产清单页面持续无法打开，疑似 Steam E502 L2")
+    if self._stopped():
+        return None
+    try:
+        self.page.wait_for_load_state("domcontentloaded", timeout=8000)
+    except Exception:
+        pass
+    _raise_if_steam_e502(self, "资产清单页面")
+    deadline = time.time() + 18
+    while time.time() < deadline:
+        body_text = _fast_page_text(self)
+        if _text_has_steam_e502(body_text):
+            _raise_if_steam_e502(self, "资产清单页面")
+        if product_in_text(product, body_text):
+            official_name = str(product["official_name"])
+            label = status_text if official_name in status_text else f"{status_text}-{official_name}"
+            return self._capture_page(task, label)
+        time.sleep(0.8)
+    self._log(f"资产清单中未找到《{product['official_name']}》")
+    return None
+
+
+def _fast_claim_friend_game_gift(self: SteamBrowserController, task: Task) -> bool:
+    product = self._friend_claim_product(task)
+    if product is None:
+        return False
+    if not self._login_friend_claim_task(task):
+        return False
+
+    if not self._open_gift_notification_page(task, product):
+        already_path = self._verify_friend_game_asset(task, "自动游戏领取-资产已确认")
+        if already_path is not None:
+            if not self.logout_by_menu():
+                self.app.ui_friend_game_claim_issue(task.id, "资产已存在，但登出未确认")
+                return False
+            self.app.ui_friend_game_claim_finished(
+                task.id,
+                f"未打开礼物页，但资产清单已存在《{product['official_name']}》",
+                already_path,
+            )
+            return True
+        self.app.ui_friend_game_claim_issue(task.id, "未能打开待收礼物页，且资产清单尚未出现目标游戏")
+        return False
+
+    self.app.ui_friend_game_claim_step(task.id, "待收礼物页", "已直达待收礼物页面")
+    if not self._claim_gift_on_current_page(task, product):
+        existing_path = self._verify_friend_game_asset(task, "自动游戏领取-资产已确认")
+        if existing_path is not None:
+            if not self.logout_by_menu():
+                self.app.ui_friend_game_claim_issue(task.id, "资产已存在，但登出未确认")
+                return False
+            self.app.ui_friend_game_claim_finished(
+                task.id,
+                f"礼物控件未再次出现，但资产清单已存在《{product['official_name']}》",
+                existing_path,
+            )
+            return True
+        self.app.ui_friend_game_claim_issue(task.id, "礼物页面未能自动完成领取，请人工检查当前页面")
+        return False
+
+    path = self._verify_friend_game_asset(task, "自动游戏领取-资产已确认")
+    if path is None:
+        self.app.ui_friend_game_claim_issue(task.id, f"领取后资产清单中未找到《{product['official_name']}》")
+        return False
+    if not self.logout_by_menu():
+        self.app.ui_friend_game_claim_issue(task.id, "领取后登出未确认")
+        return False
+    self.app.ui_friend_game_claim_finished(
+        task.id,
+        f"已确认《{product['official_name']}》进入账号资产列表",
+        path,
+    )
+    return True
+
+
+SteamBrowserController._open_gift_notification_page = _fast_open_gift_notification_page
+SteamBrowserController._click_positive_gift_claim_control = _fast_click_positive_gift_claim_control
+SteamBrowserController._claim_gift_on_current_page = _fast_claim_gift_on_current_page
+SteamBrowserController._verify_friend_game_asset = _fast_verify_friend_game_asset
+SteamBrowserController.claim_friend_game_gift = _fast_claim_friend_game_gift
+
+
+def _ui_friend_game_claim_e502(self: SteamTaskAssistant, task_id: int, message: str) -> None:
+    self.auto_pause_event.set()
+
+    def update() -> None:
+        self.store.update_friend_claim_state(
+            task_id,
+            "需要人工处理",
+            "Steam E502 L2-待稍后重试",
+            "",
+        )
+        self.store.add_event(task_id, "Steam E502 L2", message)
+        self.friend_claim_progress_var.set("好友码提货：Steam E502 L2，已暂停等待稍后重试")
+        self.status_var.set(message)
+        self.refresh_tasks()
+        if self.current_task_id == task_id:
+            self.fill_codes(self.current_task())
+            self.fill_logs(task_id)
+
+    self.root.after(0, update)
+
+
+def _e502_safe_claim_friend_game_gift(self: SteamBrowserController, task: Task) -> bool:
+    try:
+        return _fast_claim_friend_game_gift(self, task)
+    except SteamE502Error as exc:
+        message = f"{exc}；这通常是 Steam 服务端限流/暂时不可用，已冷却重试但仍失败。请稍后单独重试该账号。"
+        self._log(message)
+        self.app.ui_friend_game_claim_e502(task.id, message)
+        return False
+
+
+SteamTaskAssistant.ui_friend_game_claim_e502 = _ui_friend_game_claim_e502
+SteamBrowserController.claim_friend_game_gift = _e502_safe_claim_friend_game_gift
 
 
 def main() -> None:

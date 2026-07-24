@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 APP_DIR = Path(__file__).resolve().parent
-LOG_PATH = APP_DIR / "startup_error.log"
+LOG_PATH = APP_DIR / "启动错误.log"
 
 
 def main() -> None:
